@@ -1,0 +1,14 @@
+{
+  "name": "github-degrees",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Find the shortest follow chain between two GitHub users",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
