@@ -71,34 +71,83 @@ export function loadCache(file) {
   }
 }
 
-// ponytail: fixed hourly window per IP, in memory; resets on restart.
-const ipWindows = new Map(); // ip -> { start, count }
 const HOUR_MS = 60 * 60 * 1000;
 
-function takeUpstreamSlot(ip) {
-  const now = Date.now();
-  let w = ipWindows.get(ip);
-  if (!w || now - w.start >= HOUR_MS) {
-    w = { start: now, count: 0 };
-    ipWindows.set(ip, w);
-    if (ipWindows.size > 10000) {
-      for (const [k, v] of ipWindows) if (now - v.start >= HOUR_MS) ipWindows.delete(k);
-    }
-  }
-  if (w.count >= PER_IP_HOURLY) return { ok: false, retryAfter: Math.ceil((w.start + HOUR_MS - now) / 1000) };
-  w.count += 1;
-  return { ok: true };
+// Where cached responses and per-IP counters live. Two interchangeable
+// backends with the same async get / set / takeSlot:
+//  - memory (+ the disk file above): local `npm start` and tests
+//  - Redis: Vercel, where the disk is temporary and several instances run at once
+export function createMemoryStore() {
+  const ipWindows = new Map(); // ip -> { start, count }
+  return {
+    async get(key) {
+      return cache.get(key) ?? null;
+    },
+    async set(key, entry) {
+      cache.set(key, entry);
+      scheduleSave();
+    },
+    // ponytail: fixed hourly window per IP, per process; resets on restart.
+    async takeSlot(ip) {
+      const now = Date.now();
+      let w = ipWindows.get(ip);
+      if (!w || now - w.start >= HOUR_MS) {
+        w = { start: now, count: 0 };
+        ipWindows.set(ip, w);
+        if (ipWindows.size > 10000) {
+          for (const [k, v] of ipWindows) if (now - v.start >= HOUR_MS) ipWindows.delete(k);
+        }
+      }
+      if (w.count >= PER_IP_HOURLY) return { ok: false, retryAfter: Math.ceil((w.start + HOUR_MS - now) / 1000) };
+      w.count += 1;
+      return { ok: true };
+    },
+  };
+}
+
+export function createRedisStore(redis) {
+  return {
+    async get(key) {
+      return (await redis.get(`gh:${key}`)) ?? null;
+    },
+    async set(key, entry) {
+      await redis.set(`gh:${key}`, entry, { px: MAX_AGE_MS }); // Redis expiry replaces the file's pruning
+    },
+    // Fixed clock-hour window, one counter shared by every instance.
+    async takeSlot(ip) {
+      const now = Date.now();
+      const windowEnd = (Math.floor(now / HOUR_MS) + 1) * HOUR_MS;
+      const key = `ip:${ip}:${windowEnd}`;
+      const count = await redis.incr(key);
+      if (count === 1) await redis.pexpire(key, HOUR_MS);
+      if (count > PER_IP_HOURLY) return { ok: false, retryAfter: Math.ceil((windowEnd - now) / 1000) };
+      return { ok: true };
+    },
+  };
+}
+
+let store = createMemoryStore();
+export function setStore(s) {
+  store = s;
+}
+
+// Vercel's Upstash integration injects these (either naming style).
+const usingRedis = Boolean(process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL);
+if (usingRedis) {
+  const { Redis } = await import('@upstash/redis');
+  store = createRedisStore(Redis.fromEnv());
 }
 
 // Returns { status, body, remaining, reset, cacheStatus } where cacheStatus is
 // hit | revalidated | stale | miss, or { networkError } / { limited, retryAfter }.
 // `compact` shrinks a 200 body before it's cached.
 async function ghGet(apiPath, { ip, compact = (b) => b, cacheable = true } = {}) {
-  const cached = cacheable ? cache.get(apiPath) : null;
+  // If the store is down, carry on uncached (and unmetered) rather than fail every request.
+  const cached = cacheable ? await store.get(apiPath).catch(() => null) : null;
   if (cached && Date.now() - cached.fetchedAt < FRESH_MS) return { ...cached, cacheStatus: 'hit' };
 
   if (ip !== undefined) {
-    const slot = takeUpstreamSlot(ip);
+    const slot = await store.takeSlot(ip).catch(() => ({ ok: true }));
     if (!slot.ok) return cached ? { ...cached, cacheStatus: 'stale' } : { limited: true, retryAfter: slot.retryAfter };
   }
 
@@ -122,9 +171,9 @@ async function ghGet(apiPath, { ip, compact = (b) => b, cacheable = true } = {})
   const reset = response.headers.get('x-ratelimit-reset');
 
   if (response.status === 304 && cached) {
-    cached.fetchedAt = Date.now();
-    scheduleSave();
-    return { ...cached, remaining, reset, cacheStatus: 'revalidated' };
+    const refreshed = { ...cached, fetchedAt: Date.now() };
+    await store.set(apiPath, refreshed).catch(() => {});
+    return { ...refreshed, remaining, reset, cacheStatus: 'revalidated' };
   }
   // Out of quota: an old answer beats no answer.
   if ((response.status === 403 || response.status === 429) && cached) {
@@ -145,8 +194,7 @@ async function ghGet(apiPath, { ip, compact = (b) => b, cacheable = true } = {})
     fetchedAt: Date.now(),
   };
   if (cacheable && (response.status === 200 || response.status === 404)) {
-    cache.set(apiPath, entry);
-    scheduleSave();
+    await store.set(apiPath, entry).catch(() => {});
   }
   return { ...entry, remaining, reset, cacheStatus: 'miss' };
 }
@@ -222,11 +270,15 @@ app.get('/api/rate_limit', async (req, res) => {
   reply(res, r, (body) => body);
 });
 
+// Local only: on Vercel, files in public/ are served by the CDN instead.
 app.use(express.static('public'));
 
-// Only start listening when run directly (`node server.js`), not when imported by tests.
+// Vercel imports this default export; locally `npm start` runs the block below.
+export default app;
+
+// Only start listening when run directly (`node server.js`), not when imported by tests or Vercel.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  if (CACHE_FILE) {
+  if (CACHE_FILE && !usingRedis) {
     loadCache(CACHE_FILE);
     persistTo = CACHE_FILE;
     const flushAndExit = () => {
@@ -237,5 +289,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.on('SIGTERM', flushAndExit);
   }
   const port = process.env.PORT || 3000;
-  app.listen(port, () => console.log(`Listening on http://localhost:${port} (${cache.size} cached responses)`));
+  const cacheInfo = usingRedis ? 'cache: Redis' : `cache: ${cache.size} responses on disk`;
+  app.listen(port, () => console.log(`Listening on http://localhost:${port} (${cacheInfo})`));
 }

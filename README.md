@@ -62,6 +62,28 @@ Optional settings in `.env`:
 | `CACHE_FILE` | `.cache/github-cache.json` | Where the cache is saved; set empty to keep it in memory only |
 | `TRUST_PROXY` | unset | Set to `1` behind a reverse proxy so the per-IP limit sees the real visitor IP. Leave unset otherwise, or visitors could fake their IP. |
 
+## Deploying to Vercel (free Hobby plan)
+
+The same code runs on Vercel: it imports the Express app from `server.js`, serves `public/` from its CDN,
+and, because Vercel's disk is temporary and several instances may run at once, keeps the cache and the
+per-IP counters in **Upstash Redis** instead of the file. Without Redis configured it still works, just
+with a cache that isn't shared or kept.
+
+1. Push the repo to GitHub.
+2. On [vercel.com](https://vercel.com): **Add New → Project**, import the repo. Leave the build settings at
+   their defaults; there's no build step.
+3. **Settings → Environment Variables:** add `GITHUB_TOKEN` (mark it *Sensitive*) and `TRUST_PROXY` = `1`.
+4. **Storage → Create Database → Upstash for Redis**, free plan. Pick the region closest to your functions'
+   region (**Settings → Functions**), and connect it to the project for all environments. This adds the Redis
+   variables automatically.
+5. **Deployments → ⋯ → Redeploy**, since environment variables only apply to new deployments.
+
+After that, every push to `main` redeploys the live site, and pushes to other branches get their own
+preview URL. Check it works by running the same search twice: the second run should show
+"0 GitHub requests used".
+
+The Hobby plan is for non-commercial use.
+
 ## Tests
 
 ```
@@ -69,4 +91,4 @@ npm test
 ```
 
 Runs the search algorithm's unit tests (against a mocked API, on a small fake graph), the server's
-username/page validation tests, and the cache, ETag-revalidation and per-IP-limit tests (GitHub stubbed).
+username/page validation tests, and the cache, ETag-revalidation and per-IP-limit tests for both the disk and Redis stores (GitHub and Redis stubbed).
