@@ -73,8 +73,13 @@
     <p>
       A chain can be missed even when one exists: GitHub's follower and following lists are paginated and
       this app only checks a limited number of pages per account, the search stops once it reaches the
-      configured maximum degrees, and it stops entirely once the hourly rate limit runs out. When no chain
-      is found, that means none was found within those limits — not that no connection exists.
+      configured maximum degrees, a single search spends at most 400 GitHub requests, and it stops entirely
+      once the hourly rate limit runs out. When no chain is found, that means none was found within those
+      limits — not that no connection exists.
+    </p>
+    <p>
+      Every GitHub answer is cached on the server for days, so accounts that show up in many searches are
+      only fetched once, and repeating a search costs almost nothing.
     </p>
   </section>
 </main>

@@ -130,3 +130,53 @@ test('a bad token (401) is surfaced as a thrown SearchError', async () => {
     (err) => err instanceof SearchError && err.code === 'bad_token',
   );
 });
+
+// Wraps the fake so list requests (not user lookups) can be made to misbehave.
+function withListResponses(fetchJson, respond) {
+  return async (path, opts) => (path.startsWith('/api/user/') ? fetchJson(path, opts) : respond(path, opts, fetchJson));
+}
+
+test('a failed request is reported as an error, not as "no link found"', async () => {
+  const { fetchJson: real } = buildFakeFetch(graphA);
+  const fetchJson = withListResponses(real, async () => ({ status: 500, data: { message: 'boom' } }));
+  const result = await findConnection('alice', 'dave', { fetchJson, maxDegrees: 6, maxPages: 1 });
+  assert.equal(result.status, 'not_found');
+  assert.equal(result.reason, 'error');
+  assert.equal(result.message, 'boom');
+});
+
+test('retries a transient 5xx instead of giving up', async () => {
+  const { fetchJson: real } = buildFakeFetch(graphA);
+  let failuresLeft = 1;
+  const fetchJson = withListResponses(real, async (path, opts, next) => {
+    if (failuresLeft-- > 0) return { status: 502, data: { message: 'timeout' } };
+    return next(path, opts);
+  });
+  const result = await findConnection('alice', 'dave', { fetchJson, maxDegrees: 6, maxPages: 1 });
+  assert.equal(result.status, 'found');
+  assert.deepEqual(result.path, ['alice', 'bob', 'carol', 'dave']);
+});
+
+test('stops at the per-search GitHub request budget', async () => {
+  const { fetchJson } = buildFakeFetch(graphA);
+  const result = await findConnection('alice', 'dave', { fetchJson, maxDegrees: 6, maxPages: 1, maxRequests: 3 });
+  assert.equal(result.status, 'not_found');
+  assert.equal(result.reason, 'budget');
+});
+
+test('answers from the server cache cost nothing against the budget', async () => {
+  const { fetchJson: real } = buildFakeFetch(graphA);
+  const fetchJson = async (path, opts) => ({ ...(await real(path, opts)), cached: true });
+  const result = await findConnection('alice', 'dave', { fetchJson, maxDegrees: 6, maxPages: 1, maxRequests: 1 });
+  assert.equal(result.status, 'found');
+  assert.equal(result.stats.requests, 0);
+  assert.ok(result.stats.cacheHits > 0);
+});
+
+test('the server per-IP limit is reported as such, not as GitHub rate limiting', async () => {
+  const { fetchJson: real } = buildFakeFetch(graphA);
+  const fetchJson = withListResponses(real, async () => ({ status: 429, data: { limit: 'per_ip', retryAfter: 120 } }));
+  const result = await findConnection('alice', 'dave', { fetchJson, maxDegrees: 6, maxPages: 1 });
+  assert.equal(result.reason, 'ip_limit');
+  assert.equal(result.retryAfter, 120);
+});

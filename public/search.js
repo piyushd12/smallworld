@@ -50,6 +50,8 @@ function sideSnapshot(side) {
   }));
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 export async function findConnection(source, target, opts) {
   const {
     fetchJson,
@@ -57,30 +59,48 @@ export async function findConnection(source, target, opts) {
     maxDegrees = 6,
     maxPages = 3,
     concurrency = 4,
+    // One shared token serves every visitor, so a single search may spend at
+    // most this many real GitHub requests (cache hits are free).
+    maxRequests = 400,
     signal,
     onProgress = () => {},
   } = opts;
 
   const startedAt = Date.now();
-  let requests = 0;
+  let requests = 0; // real GitHub requests
+  let cacheHits = 0; // answered from the server's cache, costing no quota
   let checked = 0;
   const edges = new Set(); // "a>b" means a follows b
 
-  const stats = () => ({ explored: 0, requests, ms: Date.now() - startedAt });
+  const stats = () => ({ explored: 0, requests, cacheHits, ms: Date.now() - startedAt });
 
   if (source.trim().toLowerCase() === target.trim().toLowerCase()) {
     return { status: 'same', source, target, path: [source], hops: [], stats: stats() };
   }
 
+  // fetchJson plus bookkeeping, and a couple of retries for transient 5xx
+  // errors so one flaky GitHub response doesn't end an otherwise good search.
+  async function get(path) {
+    for (let attempt = 1; ; attempt++) {
+      const res = await fetchJson(path, { signal });
+      if (res.cached) cacheHits += 1;
+      else requests += 1;
+      if (res.status >= 500 && attempt < 3) {
+        await sleep(attempt * 500);
+        continue;
+      }
+      return res;
+    }
+  }
+
   async function fetchUser(login) {
     let res;
     try {
-      res = await fetchJson(`/api/user/${login}`, { signal });
+      res = await get(`/api/user/${login}`);
     } catch (err) {
       if (err?.name === 'AbortError') throw new SearchError('aborted', 'Search was stopped');
       throw err;
     }
-    requests += 1;
     if (res.status === 401) throw new SearchError('bad_token', 'GitHub token is invalid');
     if (res.status === 404) return null;
     if (res.status !== 200) throw new SearchError('fetch_error', res.data?.message || 'GitHub request failed');
@@ -101,7 +121,7 @@ export async function findConnection(source, target, opts) {
 
   let meet = null;
   let reason = null;
-  let resetAt = null;
+  let stopInfo = {};
 
   while (true) {
     if (sideS.depth + sideT.depth >= maxDegrees) { reason = 'max_degrees'; break; }
@@ -124,22 +144,31 @@ export async function findConnection(source, target, opts) {
         let page = 1;
         while (page <= maxPages) {
           if (signal?.aborted) { roundStop = { reason: 'aborted' }; return false; }
+          if (requests >= maxRequests) { roundStop = { reason: 'budget' }; return false; }
           let res;
           try {
-            res = await fetchJson(`/api/${kind}/${login}?page=${page}`, { signal });
+            res = await get(`/api/${kind}/${login}?page=${page}`);
           } catch (err) {
             if (err?.name === 'AbortError') { roundStop = { reason: 'aborted' }; return false; }
             throw err;
           }
-          requests += 1;
-          onProgress({ degree: sideS.depth + sideT.depth, checked, requests, remaining: res.remaining });
+          onProgress({ degree: sideS.depth + sideT.depth, checked, requests, cacheHits, remaining: res.remaining });
 
           if (res.status === 401) throw new SearchError('bad_token', 'GitHub token is invalid');
+          if (res.status === 429 && res.data?.limit === 'per_ip') {
+            roundStop = { reason: 'ip_limit', retryAfter: res.data.retryAfter };
+            return false;
+          }
           if (res.status === 403 || res.status === 429) {
             roundStop = { reason: 'rate_limit', reset: res.reset };
             return false;
           }
-          if (res.status !== 200) { roundStop = { reason: 'dead_end' }; return false; }
+          // A failed request is not the frontier running dry; keep the two
+          // apart so a real error never shows up as "no link found".
+          if (res.status !== 200) {
+            roundStop = { reason: 'error', message: res.data?.message };
+            return false;
+          }
 
           const items = res.data.items ?? [];
           for (const u of items) {
@@ -162,7 +191,7 @@ export async function findConnection(source, target, opts) {
       return true;
     });
 
-    if (roundStop) { reason = roundStop.reason; resetAt = roundStop.reset ?? null; break; }
+    if (roundStop) { ({ reason, ...stopInfo } = roundStop); break; }
 
     side.frontier = [...nextDiscovered.keys()].filter((login) => side.nodes.get(login).depth === side.depth);
     side.discoveredBy = nextDiscovered;
@@ -177,10 +206,20 @@ export async function findConnection(source, target, opts) {
   }
 
   const explored = { source: sideSnapshot(sideS), target: sideSnapshot(sideT) };
-  const baseStats = { explored: sideS.nodes.size + sideT.nodes.size, requests, ms: Date.now() - startedAt };
+  const baseStats = { explored: sideS.nodes.size + sideT.nodes.size, requests, cacheHits, ms: Date.now() - startedAt };
 
   if (!meet) {
-    return { status: 'not_found', reason, resetAt, source: srcUser.login, target: tgtUser.login, explored, stats: baseStats };
+    return {
+      status: 'not_found',
+      reason,
+      resetAt: stopInfo.reset ?? null,
+      message: stopInfo.message ?? null,
+      retryAfter: stopInfo.retryAfter ?? null,
+      source: srcUser.login,
+      target: tgtUser.login,
+      explored,
+      stats: baseStats,
+    };
   }
 
   const left = [];

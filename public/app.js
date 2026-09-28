@@ -44,13 +44,15 @@ function makeFetchJson() {
     const res = await fetch(path, { signal });
     const remaining = res.headers.get('x-ratelimit-remaining');
     const reset = res.headers.get('x-ratelimit-reset');
+    // Anything the server answered from its cache cost no GitHub quota.
+    const cached = ['hit', 'revalidated', 'stale'].includes(res.headers.get('x-cache'));
     let data = null;
     try {
       data = await res.json();
     } catch {
       // no/invalid JSON body
     }
-    return { status: res.status, data, remaining, reset };
+    return { status: res.status, data, remaining, reset, cached };
   };
 }
 
@@ -66,10 +68,11 @@ function resetUI() {
   statusLine.textContent = 'Starting search…';
 }
 
-function updateStatus({ degree, checked, requests, remaining }) {
+function updateStatus({ degree, checked, requests, cacheHits, remaining }) {
   statusLine.hidden = false;
   const rate = remaining != null ? `, ${remaining} rate limit remaining` : '';
-  statusLine.textContent = `Searching degree ${degree}… ${checked} users checked, ${requests} requests used${rate}.`;
+  statusLine.textContent =
+    `Searching degree ${degree}… ${checked} users checked, ${requests} GitHub requests (${cacheHits} more from cache)${rate}.`;
 }
 
 form.addEventListener('submit', async (e) => {
@@ -139,6 +142,13 @@ function handleResult(result) {
       showError(`Hit the GitHub rate limit. It resets at ${when}. No link found within the limits.`);
     } else if (result.reason === 'aborted') {
       showError('Search stopped. No link found within the limits.');
+    } else if (result.reason === 'budget') {
+      showError(`Stopped after ${result.stats.requests} GitHub requests, the per-search limit. No link found within the limits — try fewer degrees or pages.`);
+    } else if (result.reason === 'ip_limit') {
+      const mins = Math.ceil((result.retryAfter ?? 3600) / 60);
+      showError(`Too many GitHub lookups from your network. Try again in about ${mins} minute${mins === 1 ? '' : 's'}.`);
+    } else if (result.reason === 'error') {
+      showError(`GitHub request failed${result.message ? `: ${result.message}` : ''}. Try again.`);
     } else {
       showError('No link found within the limits (see "How it works" below).');
     }
@@ -308,7 +318,8 @@ function renderStats(result) {
   statsEl.innerHTML = '';
   const items = [
     `${result.stats.explored} users explored`,
-    `${result.stats.requests} requests used`,
+    `${result.stats.requests} GitHub requests used`,
+    `${result.stats.cacheHits} answered from cache`,
     `${(result.stats.ms / 1000).toFixed(1)}s`,
   ];
   for (const text of items) {
