@@ -2,6 +2,10 @@
 
 Find the shortest follow chain between two GitHub users.
 
+Enter a source and a target username, and smallworld shows the chain of people linking them, both as a
+row of profiles with arrows showing who follows whom and as a graph of the accounts it explored along the
+way.
+
 ## The small-world phenomenon
 
 In 1967 the psychologist Stanley Milgram asked people in the American Midwest to get a letter to a
@@ -11,105 +15,123 @@ everyone else through a surprisingly short chain of people. Later work (Watts an
 why. Most connections are local, but a few long-range links and well-connected hubs shrink the distance
 across the whole network.
 
-smallworld measures the same thing on GitHub, where the "acquaintance" is a follow. Given a source and a
-target account, it finds the shortest chain of follows between them and reports its length in **degrees**
-(hops). A chain of N degrees has N−1 people in between. There are two ways to count a link:
+smallworld measures the same thing on GitHub, where the "acquaintance" is a follow. The length of the
+chain is given in **degrees** (hops): a chain of N degrees has N−1 people in between. There are two ways to
+count a link:
 
 - **Either person follows the other.** A follow in either direction counts, like an acquaintance.
-- **Follow chains only.** Every step must be a follow in the forward direction (A follows B follows C), so the
-  chain has to go the direction the follows go.
+- **Follow chains only.** Every step must be a follow in the forward direction (A follows B follows C).
 
-The two can differ a lot. Many people follow popular accounts, but popular accounts rarely follow back.
-For example, one pair of accounts is 2 degrees apart counting either direction, but 5 degrees apart as a
-forward chain.
+The two can differ a lot. Many people follow popular accounts, but popular accounts rarely follow back, so
+two people can be 2 degrees apart counting either direction yet 5 degrees apart as a forward chain.
 
-## Setup
+## How it works
 
-1. **(Optional but recommended) Create a GitHub token.** Without one you're limited to 60 requests/hour,
-   which caps how far the search can look. Go to
-   [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new)
-   and create a **fine-grained token** with **read-only access to public repositories** — it needs no
-   other permissions, since it's only used to read public profiles and follower lists.
-2. Copy `.env.example` to `.env` and paste the token in:
+smallworld runs a **bidirectional breadth-first search**. One search grows outward from the source, the
+other outward from the target, one layer of followers/following at a time. Each round expands whichever
+side has fewer accounts waiting, and within a round, accounts that many others point to are checked
+first, since such hubs are the likeliest to bridge the two sides. When the two searches meet, the round is
+finished and the shortest chain found is returned.
+
+In "follow chains only" mode the source side walks forward along the accounts people follow, and the
+target side walks backward along their followers, so every link in the result points the right way.
+
+Some searches can be answered from the two profiles alone. If the source follows nobody, or nobody follows
+the target, no forward chain can exist, and smallworld says so without searching. Otherwise the search is
+bounded by the maximum number of degrees, by how many pages of each follower list it reads, and by
+GitHub's rate limit. So when it doesn't find a chain, it tells you which limit it reached: a missing
+result means none was found within those limits, not that no connection exists.
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph browser["Browser"]
+        direction LR
+        ui["<b>index.html · app.js</b><br/>form, chain, graph"]
+        search["<b>search.js</b><br/>bidirectional search"]
+        ui <--> search
+    end
+
+    subgraph server["Server · Node.js + Express"]
+        direction LR
+        api["<b>server.js</b><br/>validates input<br/>4 endpoints only<br/>keeps the token secret"]
+        cache[("<b>Cache</b><br/>disk file or Redis")]
+        limit{{"<b>Visitor limit</b><br/>GitHub calls per IP"}}
+        api <-- "hit: answered at once" --> cache
+        api -- "miss or stale" --> limit
+    end
+
+    github[("<b>GitHub REST API</b><br/>profiles · followers · following")]
+
+    search -- "/api/user · /api/followers · /api/following" --> api
+    limit -- "token + ETag" --> github
+
+    classDef client fill:#dbeafe,stroke:#3b82f6,color:#1f2328
+    classDef app fill:#dcfce7,stroke:#16a34a,color:#1f2328
+    classDef store fill:#fef3c7,stroke:#d97706,color:#1f2328
+    classDef ext fill:#ede9fe,stroke:#7c3aed,color:#1f2328
+    class ui,search client
+    class api,limit app
+    class cache store
+    class github ext
+    style browser fill:none,stroke:#8b949e,stroke-dasharray:5 5
+    style server fill:none,stroke:#8b949e,stroke-dasharray:5 5
+```
+
+- **The search runs in the browser.** `public/search.js` is a plain ES module that takes a fetch function,
+  so the same code runs against the real API or a mocked graph. It also caps how many GitHub requests one
+  search may spend.
+- **The server is a thin, locked-down proxy.** It holds the GitHub token so it never reaches the browser,
+  allows only its four endpoints, validates usernames and page numbers, and returns only the fields the page
+  needs. Each visitor can only cause a limited number of GitHub calls per hour.
+- The frontend is plain HTML, CSS and JavaScript, with no framework and no build step. The graph is drawn
+  as inline SVG.
+
+### One lookup, and why repeat searches are cheap
+
+Popular accounts turn up in many different searches, so every GitHub response is cached. For an hour it is
+served as-is; after that it is revalidated with its ETag, and GitHub doesn't charge rate limit for an
+unchanged answer. Entries are kept for up to a week.
+
+```mermaid
+sequenceDiagram
+    participant B as search.js (browser)
+    participant S as server.js
+    participant C as Cache
+    participant G as GitHub
+    B->>S: GET /api/followers/alice?page=1
+    S->>C: look up
+    alt cached less than 1 hour ago
+        C-->>S: cached page
+    else older, or not cached
+        Note over S: check this visitor's hourly limit
+        S->>G: request with token (and ETag if cached)
+        alt unchanged since last time
+            G-->>S: 304 Not Modified, costs no rate limit
+        else new or changed
+            G-->>S: 200 with a new ETag
+        end
+        S->>C: save, kept up to 7 days
+    end
+    S-->>B: one page of followers
+```
+
+## Running it
+
+You need Node.js 24 and a GitHub token.
+
+1. Create a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new)
+   with **read-only access to public repositories**. It's only used to read public profiles and follower
+   lists. The app also works without one, but GitHub then allows only 60 requests an hour.
+2. Put it in a `.env` file:
    ```
    cp .env.example .env
+   # then set GITHUB_TOKEN=... in .env
    ```
-3. Install dependencies and start the server:
+3. Install and start:
    ```
    npm install
    npm start
    ```
-4. Open <http://localhost:3000>. Set `PORT` to run on a different port.
-
-The token lives only in `.env` on the server and is never sent to the browser.
-
-## How the search works
-
-The app runs a bidirectional breadth-first search: one search grows outward from the source account, another
-grows outward from the target's, and each round it expands whichever side currently has fewer people
-left to check. As soon as the two sides meet, it has found the shortest chain. Within a round it checks
-accounts that many others already point to first, since those tend to be hubs that connect to more of
-the graph.
-
-Two link modes are available: "either person follows the other" treats a follow in either direction as
-a link, while "follow chains only" requires a directed chain (A follows B follows C).
-
-A chain can be missed even when one exists, because:
-- GitHub's follower/following lists are paginated, and only a limited number of pages per account are checked.
-- The search stops at a configurable maximum number of degrees.
-- A single search may spend at most 400 GitHub requests (cached answers don't count).
-- The search stops once the hourly rate limit runs out.
-
-No result means none was found within those limits — not that no connection exists.
-
-## Hosting on one shared token
-
-Every visitor's searches spend the same token's 5,000 requests per hour, so the server protects it:
-
-- **Disk cache.** Every GitHub response is kept in `.cache/github-cache.json` for up to 7 days and
-  survives restarts. For the first hour it's served as-is; after that it's revalidated with its ETag, and
-  GitHub doesn't charge for the `304 Not Modified` reply. Hub accounts show up in many different searches,
-  so each is fetched once rather than once per search. A second identical search costs no requests.
-- **Per-search budget.** One search stops after 400 real GitHub requests.
-- **Per-IP limit.** One visitor IP can cause at most 1,000 GitHub requests per hour (`429` after that),
-  and cached answers stay available to them.
-- If GitHub itself runs out of quota or is unreachable, stale cached answers are served instead of errors.
-
-Optional settings in `.env`:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `RATE_LIMIT_PER_IP_HOUR` | `1000` | GitHub requests one visitor IP may cause per hour |
-| `CACHE_FILE` | `.cache/github-cache.json` | Where the cache is saved; set empty to keep it in memory only |
-| `TRUST_PROXY` | unset | Set to `1` behind a reverse proxy so the per-IP limit sees the real visitor IP. Leave unset otherwise, or visitors could fake their IP. |
-
-## Deploying to Vercel (free Hobby plan)
-
-The same code runs on Vercel: it imports the Express app from `server.js`, serves `public/` from its CDN,
-and, because Vercel's disk is temporary and several instances may run at once, keeps the cache and the
-per-IP counters in **Upstash Redis** instead of the file. Without Redis configured it still works, just
-with a cache that isn't shared or kept.
-
-1. Push the repo to GitHub.
-2. On [vercel.com](https://vercel.com): **Add New → Project**, import the repo. Leave the build settings at
-   their defaults; there's no build step.
-3. **Settings → Environment Variables:** add `GITHUB_TOKEN` (mark it *Sensitive*) and `TRUST_PROXY` = `1`.
-4. **Storage → Create Database → Upstash for Redis**, free plan. Pick the region closest to your functions'
-   region (**Settings → Functions**), and connect it to the project for all environments. This adds the Redis
-   variables automatically.
-5. **Deployments → ⋯ → Redeploy**, since environment variables only apply to new deployments.
-
-After that, every push to `main` redeploys the live site, and pushes to other branches get their own
-preview URL. Check it works by running the same search twice: the second run should show
-"0 GitHub requests used".
-
-The Hobby plan is for non-commercial use.
-
-## Tests
-
-```
-npm test
-```
-
-Runs the search algorithm's unit tests (against a mocked API, on a small fake graph), the server's
-username/page validation tests, and the cache, ETag-revalidation and per-IP-limit tests for both the disk and Redis stores (GitHub and Redis stubbed).
+4. Open <http://localhost:3000>. Set `PORT` to use a different port.
