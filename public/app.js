@@ -137,24 +137,48 @@ function handleResult(result) {
     return;
   }
   if (result.status === 'not_found') {
-    if (result.reason === 'rate_limit') {
-      const when = result.resetAt ? new Date(result.resetAt * 1000).toLocaleTimeString() : 'soon';
-      showError(`Hit the GitHub rate limit. It resets at ${when}. No link found within the limits.`);
-    } else if (result.reason === 'aborted') {
-      showError('Search stopped. No link found within the limits.');
-    } else if (result.reason === 'budget') {
-      showError(`Stopped after ${result.stats.requests} GitHub requests, the per-search limit. No link found within the limits — try fewer degrees or pages.`);
-    } else if (result.reason === 'ip_limit') {
-      const mins = Math.ceil((result.retryAfter ?? 3600) / 60);
-      showError(`Too many GitHub lookups from your network. Try again in about ${mins} minute${mins === 1 ? '' : 's'}.`);
-    } else if (result.reason === 'error') {
-      showError(`GitHub request failed${result.message ? `: ${result.message}` : ''}. Try again.`);
-    } else {
-      showError('No link found within the limits (see "How it works" below).');
-    }
+    showError(notFoundMessage(result));
     return;
   }
   renderFound(result);
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const TRY_EITHER = 'Switch the link mode to "Either person follows the other" in Settings to count follows in both directions.';
+
+// Why no chain was found, in terms the user can act on. The first three are
+// certain (read straight from the profiles); the rest mean "not within the
+// limits of this search", never "no connection exists".
+function notFoundMessage(result) {
+  const { maxDegrees, maxPages } = result.limits ?? {};
+  switch (result.reason) {
+    case 'isolated':
+      return `@${result.login} has no followers and follows no one, so they aren't connected to anyone on GitHub.`;
+    case 'source_follows_nobody':
+      return `@${result.login} doesn't follow anyone, so no follow chain can start from them. ${TRY_EITHER}`;
+    case 'target_has_no_followers':
+      return `Nobody follows @${result.login}, so no follow chain can reach them. ${TRY_EITHER}`;
+    case 'max_degrees':
+      return `No chain within ${plural(maxDegrees, 'degree')}. Raise "Max degrees" in Settings to search further.`;
+    case 'dead_end':
+      return `Checked everyone reachable when reading ${plural(maxPages, 'page')} (${maxPages * 100} accounts) of each follower list, without finding a chain. Raise "Max pages" in Settings to read more of each list.`;
+    case 'budget':
+      return `Stopped after ${result.stats.requests} GitHub requests, the per-search limit, without finding a chain. Try fewer degrees or pages.`;
+    case 'rate_limit': {
+      const when = result.resetAt ? new Date(result.resetAt * 1000).toLocaleTimeString() : 'soon';
+      return `Hit the GitHub rate limit before finding a chain. It resets at ${when}.`;
+    }
+    case 'ip_limit': {
+      const mins = Math.ceil((result.retryAfter ?? 3600) / 60);
+      return `Too many GitHub lookups from your network. Try again in about ${plural(mins, 'minute')}.`;
+    }
+    case 'error':
+      return `GitHub request failed${result.message ? `: ${result.message}` : ''}. Try again.`;
+    case 'aborted':
+      return 'Search stopped before a chain was found.';
+    default:
+      return 'No chain found within the limits (see "How it works" below).';
+  }
 }
 
 function renderFound(result) {

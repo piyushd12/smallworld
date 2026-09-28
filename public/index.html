@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GitHub Degrees of Separation</title>
+<title>smallworld</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header>
-  <h1>GitHub Degrees of Separation</h1>
+  <h1>smallworld</h1>
   <p class="tagline">Find the shortest follow chain between two GitHub users.</p>
 </header>
 
@@ -19,11 +19,11 @@
 <main>
   <form id="search-form">
     <div class="field-row">
-      <label for="source">Your GitHub username
-        <input id="source" name="source" type="text" placeholder="@you or github.com/you" required autocomplete="off">
+      <label for="source">Source username
+        <input id="source" name="source" type="text" placeholder="@username or github.com/username" required autocomplete="off">
       </label>
       <label for="target">Target username
-        <input id="target" name="target" type="text" placeholder="@them or github.com/them" required autocomplete="off">
+        <input id="target" name="target" type="text" placeholder="@username or github.com/username" required autocomplete="off">
       </label>
     </div>
 
@@ -65,7 +65,7 @@
   <section id="how-it-works">
     <h2>How it works</h2>
     <p>
-      The search grows two breadth-first searches at once — one outward from your account, one outward
+      The search grows two breadth-first searches at once — one outward from the source account, one outward
       from the target's — and stops as soon as they meet. Each round it expands whichever side currently
       has fewer people to check, and prioritizes accounts that many others already point to, since those
       tend to be hubs that connect to more of the graph.

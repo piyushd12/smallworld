@@ -153,7 +153,7 @@ async function ghGet(apiPath, { ip, compact = (b) => b, cacheable = true } = {})
 
   const headers = {
     Accept: 'application/vnd.github+json',
-    'User-Agent': 'github-degrees-app',
+    'User-Agent': 'smallworld',
     'X-GitHub-Api-Version': '2022-11-28',
   };
   if (token) headers.Authorization = `Bearer ${token}`;

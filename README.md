@@ -1,6 +1,27 @@
-# GitHub Degrees of Separation
+# smallworld
 
-Find the shortest follow chain between two GitHub users — "six degrees of separation" for GitHub.
+Find the shortest follow chain between two GitHub users.
+
+## The small-world phenomenon
+
+In 1967 the psychologist Stanley Milgram asked people in the American Midwest to get a letter to a
+stranger in Boston, passing it only through personal acquaintances. The letters that arrived took about
+six hops on average. That became the popular idea of "six degrees of separation": everyone is connected to
+everyone else through a surprisingly short chain of people. Later work (Watts and Strogatz, 1998) explained
+why. Most connections are local, but a few long-range links and well-connected hubs shrink the distance
+across the whole network.
+
+smallworld measures the same thing on GitHub, where the "acquaintance" is a follow. Given a source and a
+target account, it finds the shortest chain of follows between them and reports its length in **degrees**
+(hops). A chain of N degrees has N−1 people in between. There are two ways to count a link:
+
+- **Either person follows the other.** A follow in either direction counts, like an acquaintance.
+- **Follow chains only.** Every step must be a follow in the forward direction (A follows B follows C), so the
+  chain has to go the direction the follows go.
+
+The two can differ a lot. Many people follow popular accounts, but popular accounts rarely follow back.
+For example, one pair of accounts is 2 degrees apart counting either direction, but 5 degrees apart as a
+forward chain.
 
 ## Setup
 
@@ -24,7 +45,7 @@ The token lives only in `.env` on the server and is never sent to the browser.
 
 ## How the search works
 
-The app runs a bidirectional breadth-first search: one search grows outward from your account, another
+The app runs a bidirectional breadth-first search: one search grows outward from the source account, another
 grows outward from the target's, and each round it expands whichever side currently has fewer people
 left to check. As soon as the two sides meet, it has found the shortest chain. Within a round it checks
 accounts that many others already point to first, since those tend to be hubs that connect to more of

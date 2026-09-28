@@ -20,7 +20,14 @@ function buildFakeFetch(following) {
       if (!allLogins.has(login)) return { status: 404, data: { message: 'Not Found' }, remaining: 100, reset: null };
       return {
         status: 200,
-        data: { login, avatar_url: '', html_url: `https://github.com/${login}`, type: 'User', followers: 0, following: 0 },
+        data: {
+          login,
+          avatar_url: '',
+          html_url: `https://github.com/${login}`,
+          type: 'User',
+          followers: (followers[login] || []).length,
+          following: (following[login] || []).length,
+        },
         remaining: 100,
         reset: null,
       };
@@ -179,4 +186,56 @@ test('the server per-IP limit is reported as such, not as GitHub rate limiting',
   const result = await findConnection('alice', 'dave', { fetchJson, maxDegrees: 6, maxPages: 1 });
   assert.equal(result.reason, 'ip_limit');
   assert.equal(result.retryAfter, 120);
+});
+
+// quiet follows no one; fan follows quiet; loner has no follows either way.
+const graphC = { fan: ['quiet'], quiet: [], loner: [] };
+const listCalls = (calls) => calls.filter((p) => !p.startsWith('/api/user/'));
+
+test('follow chains only: a source who follows nobody is ruled out before any list is fetched', async () => {
+  const { fetchJson, calls } = buildFakeFetch(graphC);
+  const result = await findConnection('quiet', 'fan', { fetchJson, mode: 'chain', maxDegrees: 6, maxPages: 1 });
+  assert.equal(result.status, 'not_found');
+  assert.equal(result.reason, 'source_follows_nobody');
+  assert.equal(result.login, 'quiet');
+  assert.equal(listCalls(calls).length, 0);
+});
+
+test('follow chains only: a target with no followers is ruled out before any list is fetched', async () => {
+  // a follows b and c follows a, but nobody follows c
+  const { fetchJson, calls } = buildFakeFetch({ a: ['b'], c: ['a'] });
+  const result = await findConnection('a', 'c', { fetchJson, mode: 'chain', maxDegrees: 6, maxPages: 1 });
+  assert.equal(result.status, 'not_found');
+  assert.equal(result.reason, 'target_has_no_followers');
+  assert.equal(result.login, 'c');
+  assert.equal(listCalls(calls).length, 0);
+});
+
+test('follow chains only still finds a chain when one exists in the forward direction', async () => {
+  const { fetchJson } = buildFakeFetch(graphC);
+  const result = await findConnection('fan', 'quiet', { fetchJson, mode: 'chain', maxDegrees: 6, maxPages: 1 });
+  assert.equal(result.status, 'found');
+  assert.deepEqual(result.path, ['fan', 'quiet']);
+});
+
+test('either direction still works where follow chains only are impossible', async () => {
+  const { fetchJson } = buildFakeFetch(graphC);
+  const result = await findConnection('quiet', 'fan', { fetchJson, mode: 'either', maxDegrees: 6, maxPages: 1 });
+  assert.equal(result.status, 'found');
+  assert.deepEqual(result.hops, [{ from: 'quiet', to: 'fan', direction: 'followed_by' }]);
+});
+
+test('an account with no follows either way is reported as isolated in any mode', async () => {
+  const { fetchJson, calls } = buildFakeFetch(graphC);
+  const result = await findConnection('fan', 'loner', { fetchJson, mode: 'either', maxDegrees: 6, maxPages: 1 });
+  assert.equal(result.reason, 'isolated');
+  assert.equal(result.login, 'loner');
+  assert.equal(listCalls(calls).length, 0);
+});
+
+test('a limit-based miss reports the limits it was searched within', async () => {
+  const { fetchJson } = buildFakeFetch(graphA);
+  const result = await findConnection('alice', 'dave', { fetchJson, maxDegrees: 2, maxPages: 1 });
+  assert.equal(result.reason, 'max_degrees');
+  assert.deepEqual(result.limits, { maxDegrees: 2, maxPages: 1 });
 });

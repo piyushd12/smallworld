@@ -111,6 +111,19 @@ export async function findConnection(source, target, opts) {
   if (!srcUser) return { status: 'user_not_found', login: source, stats: stats() };
   if (!tgtUser) return { status: 'user_not_found', login: target, stats: stats() };
 
+  // Some searches are impossible from the two profiles alone, so say why
+  // up front instead of spending requests on follower lists.
+  const impossible = (reason, login) => ({
+    status: 'not_found', reason, login, source: srcUser.login, target: tgtUser.login, stats: stats(),
+  });
+  for (const u of [srcUser, tgtUser]) {
+    if (u.followers === 0 && u.following === 0) return impossible('isolated', u.login);
+  }
+  if (mode === 'chain') {
+    if (srcUser.following === 0) return impossible('source_follows_nobody', srcUser.login);
+    if (tgtUser.followers === 0) return impossible('target_has_no_followers', tgtUser.login);
+  }
+
   const sideS = initSide(srcUser.login, srcUser);
   const sideT = initSide(tgtUser.login, tgtUser);
 
@@ -215,6 +228,7 @@ export async function findConnection(source, target, opts) {
       resetAt: stopInfo.reset ?? null,
       message: stopInfo.message ?? null,
       retryAfter: stopInfo.retryAfter ?? null,
+      limits: { maxDegrees, maxPages },
       source: srcUser.login,
       target: tgtUser.login,
       explored,

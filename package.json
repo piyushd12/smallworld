@@ -1,5 +1,5 @@
 {
-  "name": "github-degrees",
+  "name": "smallworld",
   "version": "1.0.0",
   "private": true,
   "description": "Find the shortest follow chain between two GitHub users",
