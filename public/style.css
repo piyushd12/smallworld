@@ -235,8 +235,9 @@ button {
 .explore-line { stroke: var(--line); stroke-width: 1; }
 .path-line { stroke: var(--accent); stroke-width: 3; }
 .arrowhead { fill: var(--accent); }
-.dot { fill: var(--dot); opacity: 0.7; }
-.dot-link:hover .dot { opacity: 1; }
+.dot-ring { fill: var(--surface); stroke: var(--dot); stroke-width: 1.5; }
+.dot-group { opacity: 0.7; }
+.dot-link:hover .dot-group { opacity: 1; }
 .avatar-ring { fill: var(--surface); stroke: var(--accent); stroke-width: 2; }
 .avatar-label { fill: var(--muted); font-size: 10px; }
 

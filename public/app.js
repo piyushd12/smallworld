@@ -280,6 +280,7 @@ function renderGraph(result) {
       '<path d="M0,0 L10,5 L0,10 Z" class="arrowhead"></path>' +
       '</marker>' +
       '<clipPath id="avatarClip"><circle cx="18" cy="18" r="18"/></clipPath>' +
+      '<clipPath id="smallAvatarClip"><circle cx="10" cy="10" r="10"/></clipPath>' +
       '</defs>',
   );
 
@@ -314,7 +315,11 @@ function renderGraph(result) {
       const href = esc(n.html_url || `https://github.com/${n.login}`);
       parts.push(
         `<a href="${href}" target="_blank" rel="noopener" class="dot-link">` +
-          `<circle cx="${p.x}" cy="${p.y}" r="5" class="dot"><title>@${esc(n.login)}</title></circle>` +
+          `<g transform="translate(${p.x - 10}, ${p.y - 10})" class="dot-group">` +
+          '<title>@' + esc(n.login) + '</title>' +
+          '<circle cx="10" cy="10" r="11" class="dot-ring"></circle>' +
+          `<image href="${esc(n.avatar_url || '')}" width="20" height="20" clip-path="url(#smallAvatarClip)"></image>` +
+          '</g>' +
           '</a>',
       );
     }
