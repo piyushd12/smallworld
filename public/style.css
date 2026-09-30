@@ -267,3 +267,46 @@ footer {
   font-size: 0.8rem;
   text-align: center;
 }
+
+.shared-note {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: 0 0 8px;
+}
+
+.shared-note button {
+  padding: 4px 12px;
+  font-size: 0.85rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.share {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.share button,
+.share .button {
+  display: inline-block;
+  padding: 9px 16px;
+  font-size: 0.95rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.share button:hover,
+.share .button:hover { border-color: var(--accent); color: var(--accent); }
+
+.share [hidden], .shared-note[hidden], .stats[hidden] { display: none; }

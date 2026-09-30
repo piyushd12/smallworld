@@ -42,6 +42,25 @@ bounded by the maximum number of degrees, by how many pages of each follower lis
 GitHub's rate limit. So when it doesn't find a chain, it tells you which limit it reached: a missing
 result means none was found within those limits, not that no connection exists.
 
+Every result also has a shareable link. It carries the chain that was found, so opening it doesn't repeat
+the search: the server only re-checks that each person in the chain still follows the next, then shows the
+result (or runs a normal search if the chain no longer holds).
+
+## Sharing
+
+Each result has buttons to copy its link, share it, post it on X or LinkedIn, and download a preview
+image. Posted on LinkedIn, X, WhatsApp or Slack, the link shows a card with the chain.
+
+| URL | What it does |
+|---|---|
+| `/?from=alice&to=torvalds` | Fills the form and runs the search |
+| `/?from=alice&to=torvalds&via=bob,carol` | Shows the chain alice → bob → carol → torvalds (up to 6 names in `via`) |
+| `&mode=follow` | Follow chains only; the default is either direction |
+
+Link previews are read by crawlers that don't run JavaScript, so the server writes the preview tags into
+the page itself and draws the card as a PNG at `/og.png` (same query parameters), using
+[satori](https://github.com/vercel/satori) and [resvg](https://github.com/yisibl/resvg-js).
+
 ## Architecture
 
 ```mermaid
@@ -83,8 +102,8 @@ flowchart TB
   so the same code runs against the real API or a mocked graph. It also caps how many GitHub requests one
   search may spend.
 - **The server is a thin, locked-down proxy.** It holds the GitHub token so it never reaches the browser,
-  allows only its four endpoints, validates usernames and page numbers, and returns only the fields the page
-  needs. Each visitor can only cause a limited number of GitHub calls per hour.
+  allows only a fixed set of endpoints, validates usernames and page numbers, and returns only the fields the
+  page needs. It also serves the share-preview images. Each visitor can only cause a limited number of GitHub calls per hour.
 - The frontend is plain HTML, CSS and JavaScript, with no framework and no build step. The graph is drawn
   as inline SVG.
 
@@ -134,4 +153,5 @@ You need Node.js 24 and a GitHub token.
    npm install
    npm start
    ```
-4. Open <http://localhost:3000>. Set `PORT` to use a different port.
+4. Open <http://localhost:3000>. Set `PORT` to use a different port, and `PUBLIC_URL` to the address the site is served from (default
+   `http://localhost:3000`) so shared previews contain full links.

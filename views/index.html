@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>smallworld</title>
+<!--meta-->
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -70,12 +70,23 @@
   <div id="error-box" class="banner banner-error" hidden></div>
 
   <section id="result" hidden>
+    <p id="shared-note" class="shared-note" hidden>
+      Shared result, verified just now
+      <button type="button" id="search-again">Search again</button>
+    </p>
     <h2 id="headline"></h2>
     <div id="chain" class="chain"></div>
     <div class="graph-wrap">
       <svg id="graph" role="img" aria-label="Explored connection graph"></svg>
     </div>
     <ul id="stats" class="stats"></ul>
+    <div id="share" class="share">
+      <button type="button" id="copy-link">Copy link</button>
+      <button type="button" id="native-share" hidden>Share</button>
+      <a id="share-x" class="button" target="_blank" rel="noopener">Post on X</a>
+      <a id="share-linkedin" class="button" target="_blank" rel="noopener">Share on LinkedIn</a>
+      <a id="download-image" class="button" download="smallworld.png">Download image</a>
+    </div>
   </section>
 
   <section id="how-it-works">
@@ -96,6 +107,10 @@
     <p>
       Every GitHub answer is cached on the server for days, so accounts that show up in many searches are
       only fetched once, and repeating a search costs almost nothing.
+    </p>
+    <p>
+      A shared link carries the chain itself, so opening it doesn't repeat the search: the server only
+      re-checks that each person in the chain still follows the next, which takes a handful of cheap lookups.
     </p>
   </section>
 </main>

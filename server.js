@@ -3,6 +3,11 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { rateLimit } from 'express-rate-limit';
+import { isValidLogin, parseShareQuery, buildShareQuery } from './public/share.js';
+import { renderOg, renderDefault } from './og.js';
+
+export { isValidLogin };
 
 const token = process.env.GITHUB_TOKEN;
 const hasToken = Boolean(token);
@@ -12,12 +17,8 @@ const hasToken = Boolean(token);
 const PER_IP_HOURLY = Number(process.env.RATE_LIMIT_PER_IP_HOUR) || 1000;
 const CACHE_FILE = process.env.CACHE_FILE ?? '.cache/github-cache.json';
 
-// GitHub usernames: 1-39 chars, alphanumeric, single hyphens, no leading/trailing hyphen.
-const LOGIN_RE = /^[a-zA-Z\d](?:[a-zA-Z\d]|-(?=[a-zA-Z\d])){0,38}$/;
-
-export function isValidLogin(login) {
-  return typeof login === 'string' && LOGIN_RE.test(login);
-}
+// Absolute origin used in og:url / og:image, since crawlers need full URLs.
+const PUBLIC_URL = (process.env.PUBLIC_URL || 'http://localhost:3000').replace(/\/+$/, '');
 
 export function parsePage(raw) {
   if (raw === undefined) return 1;
@@ -193,7 +194,7 @@ async function ghGet(apiPath, { ip, compact = (b) => b, cacheable = true } = {})
     etag: response.headers.get('etag'),
     fetchedAt: Date.now(),
   };
-  if (cacheable && (response.status === 200 || response.status === 404)) {
+  if (cacheable && [200, 204, 404].includes(response.status)) {
     await store.set(apiPath, entry).catch(() => {});
   }
   return { ...entry, remaining, reset, cacheStatus: 'miss' };
@@ -268,6 +269,133 @@ app.get('/api/followers/:login', listHandler('followers'));
 app.get('/api/rate_limit', async (req, res) => {
   const r = await ghGet('/rate_limit', { cacheable: false });
   reply(res, r, (body) => body);
+});
+
+// ---- Sharing: verified chains, link-preview meta tags and preview images ----
+
+const SITE_DESC = 'Find the shortest follow chain between two GitHub users.';
+
+// Does a follow relation exist? 204 = yes, 404 = no; anything else is a failure.
+async function follows(a, b, ip) {
+  const r = await ghGet(`/users/${a.toLowerCase()}/following/${b.toLowerCase()}`, { ip });
+  if (r.limited || r.networkError) throw new Error('GitHub unavailable');
+  if (r.status === 204) return true;
+  if (r.status === 404) return false;
+  throw new Error(`GitHub answered ${r.status}`);
+}
+
+// Checks every consecutive pair in both directions. `valid` means each pair is
+// linked by a follow (forward only in follow mode).
+export async function verifyPath(logins, mode, ip) {
+  const edges = await Promise.all(
+    logins.slice(0, -1).map(async (from, i) => {
+      const to = logins[i + 1];
+      const [aFollowsB, bFollowsA] = await Promise.all([follows(from, to, ip), follows(to, from, ip)]);
+      return { from, to, aFollowsB, bFollowsA };
+    }),
+  );
+  return {
+    valid: edges.every((e) => e.aFollowsB || (mode !== 'follow' && e.bFollowsA)),
+    edges,
+    users: logins.map((login) => ({ login, avatarUrl: `https://github.com/${login}.png`, url: `https://github.com/${login}` })),
+  };
+}
+
+// Crawlers give up after a few seconds, so never let verification outlast that.
+const withTimeout = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(r, ms, null))]);
+const verifyQuietly = (q, ip) =>
+  withTimeout(verifyPath([q.from, ...q.via, q.to], q.mode, ip).catch(() => null), 2500);
+
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// The <head> tags for a link preview. q: parsed share query or null;
+// verified: verifyPath result or null.
+export function metaTags(q, verified, publicUrl = PUBLIC_URL) {
+  let title = 'smallworld';
+  let desc = SITE_DESC;
+  let query = '';
+  if (q) {
+    query = buildShareQuery(q);
+    if (verified?.valid) {
+      const n = verified.users.length - 1;
+      title = `@${q.from} is ${n} ${n === 1 ? 'degree' : 'degrees'} from @${q.to} | smallworld`;
+      desc = `${verified.users.map((u) => u.login).join(' → ')}: the shortest follow chain found on GitHub. Trace your own chain.`;
+    } else {
+      title = `How many follows between @${q.from} and @${q.to}? | smallworld`;
+      desc = `Find the shortest chain of follows between @${q.from} and @${q.to} on GitHub.`;
+    }
+  }
+  const t = escapeHtml(title);
+  const d = escapeHtml(desc);
+  const url = escapeHtml(`${publicUrl}/${query}`);
+  const image = escapeHtml(`${publicUrl}/og.png${query}`);
+  return [
+    `<title>${t}</title>`,
+    `<meta name="description" content="${d}">`,
+    `<meta property="og:title" content="${t}">`,
+    `<meta property="og:description" content="${d}">`,
+    `<meta property="og:image" content="${image}">`,
+    '<meta property="og:image:width" content="1200">',
+    '<meta property="og:image:height" content="630">',
+    `<meta property="og:url" content="${url}">`,
+    '<meta property="og:type" content="website">',
+    '<meta name="twitter:card" content="summary_large_image">',
+    `<meta name="twitter:title" content="${t}">`,
+    `<meta name="twitter:description" content="${d}">`,
+    `<meta name="twitter:image" content="${image}">`,
+  ].join('\n');
+}
+
+const searchParamsOf = (req) => new URL(req.url, 'http://x').searchParams;
+
+// Both can cause GitHub calls, so cap them per IP.
+const shareLimiter = rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: true, legacyHeaders: false });
+
+app.get('/api/verify-path', shareLimiter, async (req, res) => {
+  const logins = typeof req.query.users === 'string' ? req.query.users.split(',') : [];
+  const mode = req.query.mode ?? 'either';
+  if (logins.length < 2 || logins.length > 8 || !logins.every(isValidLogin) || !['either', 'follow'].includes(mode)) {
+    return res.status(400).json({ message: 'Invalid users or mode' });
+  }
+  // On a GitHub failure, say "not valid" and let the page run a normal search.
+  const result = await verifyPath(logins, mode, req.ip).catch(() => ({ valid: false, edges: [], users: [] }));
+  res.json(result);
+});
+
+// index.html is a template (not in public/) so Express, not the CDN, serves it.
+const indexHtml = fs.readFileSync(new URL('./views/index.html', import.meta.url), 'utf8');
+
+app.get('/', async (req, res) => {
+  const q = parseShareQuery(searchParamsOf(req));
+  const verified = q?.via ? await verifyQuietly(q, req.ip) : null;
+  res.type('html').send(indexHtml.replace('<!--meta-->', () => metaTags(q, verified)));
+});
+
+// ponytail: per-process LRU of the last 200 images; shared cache if instances multiply.
+const imageCache = new Map();
+const IMAGE_CACHE_MAX = 200;
+
+app.get('/og.png', shareLimiter, async (req, res) => {
+  const q = parseShareQuery(searchParamsOf(req));
+  const key = q ? buildShareQuery(q) : '';
+  let png = imageCache.get(key);
+  if (png) {
+    imageCache.delete(key);
+    imageCache.set(key, png);
+  } else {
+    try {
+      const verified = q?.via ? await verifyQuietly(q, req.ip) : null;
+      png = await renderOg(q, verified, PUBLIC_URL);
+      // An unverified path may only be a GitHub hiccup, so don't remember it.
+      if (!q?.via || verified?.valid) {
+        imageCache.set(key, png);
+        if (imageCache.size > IMAGE_CACHE_MAX) imageCache.delete(imageCache.keys().next().value);
+      }
+    } catch {
+      png = await renderDefault(PUBLIC_URL); // never show a crawler an error
+    }
+  }
+  res.set({ 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' }).send(png);
 });
 
 // Local only: on Vercel, files in public/ are served by the CDN instead.

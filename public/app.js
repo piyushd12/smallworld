@@ -1,4 +1,5 @@
 import { findConnection, SearchError } from './search.js';
+import { parseShareQuery, buildShareQuery } from './share.js';
 
 const form = document.getElementById('search-form');
 const sourceInput = document.getElementById('source');
@@ -15,6 +16,9 @@ const chainEl = document.getElementById('chain');
 const graphSvg = document.getElementById('graph');
 const statsEl = document.getElementById('stats');
 const tokenWarning = document.getElementById('token-warning');
+const sharedNote = document.getElementById('shared-note');
+const copyBtn = document.getElementById('copy-link');
+const nativeShareBtn = document.getElementById('native-share');
 
 let controller = null;
 let maxPagesTouched = false;
@@ -64,6 +68,7 @@ function showError(message) {
 function resetUI() {
   errorBox.hidden = true;
   resultSection.hidden = true;
+  sharedNote.hidden = true;
   statusLine.hidden = false;
   statusLine.textContent = 'Starting search…';
 }
@@ -99,7 +104,7 @@ form.addEventListener('submit', async (e) => {
       signal: controller.signal,
       onProgress: updateStatus,
     });
-    handleResult(result);
+    handleResult(result, mode);
   } catch (err) {
     handleError(err);
   } finally {
@@ -126,7 +131,7 @@ function handleError(err) {
   }
 }
 
-function handleResult(result) {
+function handleResult(result, mode) {
   statusLine.hidden = true;
   if (result.status === 'same') {
     showError('Source and target are the same user.');
@@ -140,7 +145,7 @@ function handleResult(result) {
     showError(notFoundMessage(result));
     return;
   }
-  renderFound(result);
+  renderFound(result, mode);
 }
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
@@ -181,13 +186,14 @@ function notFoundMessage(result) {
   }
 }
 
-function renderFound(result) {
+function renderFound(result, mode) {
   resultSection.hidden = false;
   const between = result.degrees - 1;
   headlineEl.textContent = `@${result.source} is ${result.degrees} degrees from @${result.target} (${between} people in between)`;
   renderChain(result);
   renderGraph(result);
   renderStats(result);
+  renderSharePanel(result, mode);
 }
 
 // Escapes values from the GitHub API (avatar/profile URLs) before they're
@@ -345,6 +351,8 @@ function renderGraph(result) {
 
 function renderStats(result) {
   statsEl.innerHTML = '';
+  statsEl.hidden = !result.stats;
+  if (!result.stats) return;
   const items = [
     `${result.stats.explored} users explored`,
     `${result.stats.requests} GitHub requests used`,
@@ -356,4 +364,79 @@ function renderStats(result) {
     li.textContent = text;
     statsEl.appendChild(li);
   }
+}
+
+// ---- Sharing ----
+
+// The form says "chain", the URL says "follow".
+const urlMode = (mode) => (mode === 'chain' ? 'follow' : 'either');
+
+function renderSharePanel(result, mode) {
+  const query = buildShareQuery({ from: result.source, to: result.target, via: result.path.slice(1, -1), mode: urlMode(mode) });
+  history.replaceState(null, '', query);
+
+  const link = `${location.origin}/${query}`;
+  const text = `I'm ${result.degrees} degrees away from @${result.target} on GitHub. Trace your own chain:`;
+  document.getElementById('share-x').href =
+    `https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}&url=${encodeURIComponent(link)}`;
+  document.getElementById('share-linkedin').href =
+    `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(link)}`;
+  document.getElementById('download-image').href = `/og.png${query}`;
+
+  copyBtn.textContent = 'Copy link';
+  copyBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(link);
+      copyBtn.textContent = 'Copied';
+    } catch {
+      copyBtn.textContent = 'Copy failed';
+    }
+    setTimeout(() => { copyBtn.textContent = 'Copy link'; }, 2000);
+  };
+  nativeShareBtn.hidden = !navigator.share;
+  nativeShareBtn.onclick = () => navigator.share({ text, url: link }).catch(() => {});
+}
+
+// Turns a verify-path reply into the same shape a search produces, so the
+// normal renderers draw it.
+function renderShared(data, mode) {
+  const path = data.users.map((u) => u.login);
+  const hops = data.edges.map((e) => ({
+    from: e.from,
+    to: e.to,
+    direction: e.aFollowsB && e.bFollowsA ? 'mutual' : e.aFollowsB ? 'follows' : 'followed_by',
+  }));
+  const nodesInfo = new Map(data.users.map((u) => [u.login, { avatar_url: u.avatarUrl, html_url: u.url }]));
+  statusLine.hidden = true;
+  renderFound({
+    status: 'found', source: path[0], target: path.at(-1), degrees: hops.length, path, hops, nodesInfo,
+    explored: { source: [], target: [] }, stats: null,
+  }, mode);
+  sharedNote.hidden = false;
+}
+
+document.getElementById('search-again').addEventListener('click', () => form.requestSubmit());
+
+// A shared link fills the form, then either shows the verified chain or searches.
+async function openSharedLink(shared, mode) {
+  resetUI();
+  statusLine.textContent = 'Checking shared result…';
+  try {
+    const res = await fetch(`/api/verify-path?users=${[shared.from, ...shared.via, shared.to].join(',')}&mode=${shared.mode}`);
+    const data = await res.json();
+    if (data.valid) return renderShared(data, mode);
+  } catch {
+    // fall through to a normal search
+  }
+  form.requestSubmit();
+}
+
+const shared = parseShareQuery(new URLSearchParams(location.search));
+if (shared) {
+  const mode = shared.mode === 'follow' ? 'chain' : 'either';
+  sourceInput.value = shared.from;
+  targetInput.value = shared.to;
+  form.mode.value = mode;
+  if (shared.via) openSharedLink(shared, mode);
+  else form.requestSubmit();
 }
