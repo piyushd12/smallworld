@@ -382,6 +382,7 @@ function renderSharePanel(result, mode) {
   document.getElementById('share-linkedin').href =
     `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(link)}`;
   document.getElementById('download-image').href = `/og.png${query}`;
+  fetch(`/og.png${query}`).catch(() => {}); // warm the server's image cache so a crawler doesn't wait for the first render
 
   copyBtn.textContent = 'Copy link';
   copyBtn.onclick = async () => {
