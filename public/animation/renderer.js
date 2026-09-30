@@ -14,6 +14,10 @@ const DIM_MS = 900;
 const DIMMED = 0.15;
 const HUBS_PER_SIDE = 6;
 const GRID = 24; // hit-test cell size, CSS pixels
+const VIEW_MS = 900;
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 8;
+const DRAG_THRESHOLD = 4; // pixels a pointer moves before a tap becomes a drag
 
 const reducedMotionQuery = matchMedia('(prefers-reduced-motion: reduce)');
 const darkQuery = matchMedia('(prefers-color-scheme: dark)');
@@ -33,7 +37,16 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
   const images = new Map();
   let width = 0;
   let height = 0;
+  let dpr = 1;
   let colors = {};
+  // Pan and zoom: screen = world * k + (x, y). Sizes are divided by the zoom
+  // (see px), so dots and labels keep their size on screen.
+  const IDENTITY = { k: 1, x: 0, y: 0 };
+  let view = IDENTITY;
+  let viewAnim = null; // { from, to, start }
+  let userMoved = false; // the viewer panned or zoomed, so don't move the view for them
+  let zoom = 1;
+  const px = (n) => n / zoom;
   let raf = null;
   let running = false;
   let dirty = true;
@@ -55,6 +68,7 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
   let ringCap;
   let grid;
   let gridStale;
+  let gridZoom;
 
   const reduced = () => reducedMotionQuery.matches;
   const duration = (ms) => (reduced() ? 0 : ms);
@@ -85,9 +99,74 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     ringCap = Math.floor(MAX_NODES / 6);
     grid = new Map();
     gridStale = false;
+    view = IDENTITY;
+    viewAnim = null;
+    userMoved = false;
     layout.clear();
     hideTooltip();
     dirty = true;
+  }
+
+  function viewAt(t) {
+    if (!viewAnim) return view;
+    const k = easeOut(progress(viewAnim.start, VIEW_MS, t));
+    if (k >= 1) {
+      view = viewAnim.to;
+      viewAnim = null;
+      return view;
+    }
+    const { from, to } = viewAnim;
+    const mix = (a, b) => a + (b - a) * k;
+    return { k: mix(from.k, to.k), x: mix(from.x, to.x), y: mix(from.y, to.y) };
+  }
+
+  function setView(v, animate = false) {
+    const now = performance.now();
+    if (animate && duration(VIEW_MS)) {
+      viewAnim = { from: viewAt(now), to: v, start: now };
+      busyFor(VIEW_MS);
+    } else {
+      viewAnim = null;
+      view = v;
+      dirty = true;
+    }
+  }
+
+  // Frames the given nodes (with room for avatars and names), never zooming
+  // in past 1x. If they already fit the unmoved canvas, it stays unmoved.
+  function fitView(nodes, animate) {
+    if (!nodes.length || !width || !height) return;
+    const pad = Math.max(48, unit() / 12);
+    const xs = nodes.map((n) => n.x);
+    const ys = nodes.map((n) => n.y);
+    const [minX, maxX, minY, maxY] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+    if (minX >= pad && maxX <= width - pad && minY >= pad && maxY <= height - pad) {
+      setView(IDENTITY, animate);
+      return;
+    }
+    const k = Math.max(MIN_ZOOM, Math.min(1, (width - 2 * pad) / Math.max(1, maxX - minX), (height - 2 * pad) / Math.max(1, maxY - minY)));
+    setView({ k, x: width / 2 - ((minX + maxX) / 2) * k, y: height / 2 - ((minY + maxY) / 2) * k }, animate);
+  }
+
+  const chainAndRoots = () => [...new Set([roots.source, roots.target, ...(chain?.nodes ?? [])].filter(Boolean))];
+
+  function fit() {
+    userMoved = false;
+    fitView(chain ? chainAndRoots() : [...visible], true);
+  }
+
+  // Zooms by `factor` around a point on screen, keeping that point still.
+  function zoomAt(sx, sy, factor) {
+    const v = viewAt(performance.now());
+    const k = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, v.k * factor));
+    setView({ k, x: sx - ((sx - v.x) * k) / v.k, y: sy - ((sy - v.y) * k) / v.k });
+    userMoved = true;
+  }
+
+  function panBy(dx, dy) {
+    const v = viewAt(performance.now());
+    setView({ k: v.k, x: v.x + dx, y: v.y + dy });
+    userMoved = true;
   }
 
   function busyFor(ms) {
@@ -204,6 +283,9 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
         const steps = Math.max(m, nodes.length - 1 - m);
         chain = { nodes, segments, start: now + duration(FLASH_MS * 0.6), steps };
         busyFor(FLASH_MS * 0.6 + steps * SEGMENT_MS + DIM_MS);
+        // The meeting point can be far out on a ring, off the canvas: frame
+        // the whole chain unless the viewer has moved the view themselves.
+        if (!userMoved) fitView(chainAndRoots(), true);
         break;
       }
       default:
@@ -217,14 +299,17 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
   }
 
   function resize() {
-    const dpr = window.devicePixelRatio || 1;
+    dpr = window.devicePixelRatio || 1;
     width = canvas.clientWidth;
     height = canvas.clientHeight;
     canvas.width = Math.round(width * dpr);
     canvas.height = Math.round(height * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     layout.resize(width, height);
     for (const n of all.values()) place(n);
+    // Positions moved with the new size, so the old pan/zoom no longer applies.
+    userMoved = false;
+    if (chain) fitView(chainAndRoots(), false);
+    else setView(IDENTITY);
     gridStale = true;
     dirty = true;
   }
@@ -232,9 +317,10 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
   // ---- drawing ----
 
   const unit = () => Math.min(width, height * 1.6);
-  const dotRadius = () => Math.max(2.4, unit() / 260);
+  // Sizes in world units that look the same on screen at any zoom.
+  const dotRadius = () => px(Math.max(2.4, unit() / 260));
   const avatarRadius = (node) => {
-    const base = Math.max(13, unit() / 28);
+    const base = px(Math.max(13, unit() / 28));
     return node.depth === 0 ? base : base * 0.78;
   };
   const isBig = (node) => node.depth === 0 || (chain && chain.nodes.includes(node));
@@ -250,8 +336,8 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
   }
 
   function drawRings(t, dim) {
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 6]);
+    ctx.lineWidth = px(1);
+    ctx.setLineDash([px(4), px(6)]);
     for (const side of ['source', 'target']) {
       if (!frontier[side]) continue;
       ctx.globalAlpha = 0.45 * dim;
@@ -264,7 +350,7 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     for (const p of pulses) {
       const k = easeOut(progress(p.start, PULSE_MS, t));
       ctx.globalAlpha = 0.5 * (1 - k);
-      ctx.lineWidth = 2 + 6 * (1 - k);
+      ctx.lineWidth = px(2 + 6 * (1 - k));
       ctx.strokeStyle = colors[p.side];
       ellipse(p.side, p.depth - 1 + k);
       ctx.stroke();
@@ -272,7 +358,7 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
   }
 
   function drawEdges(dim) {
-    ctx.lineWidth = 1;
+    ctx.lineWidth = px(1);
     for (const side of ['source', 'target']) {
       ctx.beginPath();
       for (const n of visible) {
@@ -335,10 +421,10 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
 
   function label(text, x, y, { color = colors.text, size = 12, weight = 600, alpha = 1 } = {}) {
     ctx.globalAlpha = alpha;
-    ctx.font = `${weight} ${size}px system-ui, -apple-system, "Segoe UI", sans-serif`;
+    ctx.font = `${weight} ${px(size)}px system-ui, -apple-system, "Segoe UI", sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
-    ctx.lineWidth = 4;
+    ctx.lineWidth = px(4);
     ctx.lineJoin = 'round';
     ctx.strokeStyle = colors.bg;
     ctx.strokeText(text, x, y);
@@ -359,14 +445,14 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
 
   function drawHubLabels(dim) {
     const size = Math.max(10, Math.round(unit() / 80));
-    for (const n of hubs()) label(`@${n.login}`, n.x, n.y + dotRadius() + 3, { size, weight: 500, color: colors.muted, alpha: dim });
+    for (const n of hubs()) label(`@${n.login}`, n.x, n.y + dotRadius() + px(3), { size, weight: 500, color: colors.muted, alpha: dim });
   }
 
   function drawChain(t) {
     if (!chain) return;
     ctx.strokeStyle = colors.path;
     ctx.lineCap = 'round';
-    ctx.lineWidth = Math.max(3, unit() / 220);
+    ctx.lineWidth = px(Math.max(3, unit() / 220));
     ctx.globalAlpha = 1;
     for (const s of chain.segments) {
       const k = easeOut(progress(chain.start + s.order * duration(SEGMENT_MS), SEGMENT_MS, t));
@@ -387,7 +473,7 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     ctx.globalAlpha = k;
     ctx.fillStyle = ring;
     ctx.beginPath();
-    ctx.arc(n.x, n.y, r + 3, 0, Math.PI * 2);
+    ctx.arc(n.x, n.y, r + px(3), 0, Math.PI * 2);
     ctx.fill();
     const img = images.get(n.avatarUrl);
     ctx.save();
@@ -401,7 +487,7 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     }
     ctx.restore();
     const size = Math.max(11, Math.round(unit() / 60));
-    label(`@${n.login}`, n.x, n.y + r + 6, { size, alpha: k });
+    label(`@${n.login}`, n.x, n.y + r + px(6), { size, alpha: k });
   }
 
   function drawMeetFlash(t) {
@@ -413,16 +499,20 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     const r = avatarRadius(n) * (1 + 3 * easeOut(k));
     ctx.globalAlpha = 0.8 * (1 - k);
     ctx.strokeStyle = colors.path;
-    ctx.lineWidth = 4;
+    ctx.lineWidth = px(4);
     ctx.beginPath();
     ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
     ctx.stroke();
   }
 
   function draw(t) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.globalAlpha = 1;
     ctx.fillStyle = colors.bg;
     ctx.fillRect(0, 0, width, height);
+    const v = viewAt(t);
+    zoom = v.k;
+    ctx.setTransform(dpr * v.k, 0, 0, dpr * v.k, dpr * v.x, dpr * v.y);
     const dim = dimAt(t);
     drawRings(t, dim);
     drawEdges(dim);
@@ -469,26 +559,36 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
 
   // ---- hover, tap and click ----
 
+  // The grid is in world units, with cells GRID screen pixels wide at the
+  // current zoom, so it is rebuilt when the zoom changes.
   function rebuildGrid() {
     grid = new Map();
+    const cell = GRID / zoom;
     for (const n of visible) {
-      const key = `${Math.floor(n.x / GRID)},${Math.floor(n.y / GRID)}`;
+      const key = `${Math.floor(n.x / cell)},${Math.floor(n.y / cell)}`;
       if (!grid.has(key)) grid.set(key, []);
       grid.get(key).push(n);
     }
     gridStale = false;
+    gridZoom = zoom;
   }
 
-  function hitTest(x, y) {
-    if (gridStale) rebuildGrid();
-    const cx = Math.floor(x / GRID);
-    const cy = Math.floor(y / GRID);
+  // Finds the node under a point on screen.
+  function hitTest(sx, sy) {
+    const v = viewAt(performance.now());
+    zoom = v.k;
+    if (gridStale || gridZoom !== zoom) rebuildGrid();
+    const x = (sx - v.x) / v.k;
+    const y = (sy - v.y) / v.k;
+    const cell = GRID / zoom;
+    const cx = Math.floor(x / cell);
+    const cy = Math.floor(y / cell);
     let best = null;
     let bestD = Infinity;
     for (let i = -2; i <= 2; i++) {
       for (let j = -2; j <= 2; j++) {
         for (const n of grid.get(`${cx + i},${cy + j}`) ?? []) {
-          const reach = isBig(n) ? avatarRadius(n) + 3 : Math.max(8, dotRadius() * 2.5);
+          const reach = isBig(n) ? avatarRadius(n) + px(3) : Math.max(px(8), dotRadius() * 2.5);
           const d = Math.hypot(n.x - x, n.y - y);
           if (d <= reach && (d < bestD || (isBig(n) && !isBig(best)))) {
             best = n;
@@ -523,10 +623,13 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     }
     tooltip.hidden = false;
     // Keep the tooltip inside the canvas.
+    const v = viewAt(performance.now());
+    const sx = n.x * v.k + v.x;
+    const sy = n.y * v.k + v.y;
     const tw = tooltip.offsetWidth;
     const th = tooltip.offsetHeight;
-    const left = Math.min(Math.max(4, n.x - tw / 2), width - tw - 4);
-    const top = n.y - th - 12 >= 4 ? n.y - th - 12 : n.y + 14;
+    const left = Math.min(Math.max(4, sx - tw / 2), width - tw - 4);
+    const top = sy - th - 12 >= 4 ? sy - th - 12 : sy + 14;
     tooltip.style.left = `${left}px`;
     tooltip.style.top = `${top}px`;
   }
@@ -540,17 +643,77 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     return [e.clientX - rect.left, e.clientY - rect.top];
   };
 
+  // Drag to pan (one pointer), pinch to zoom (two). A pointer that barely
+  // moves is a click or tap instead.
+  const pointers = new Map(); // pointerId -> [x, y]
+  let gesture = null; // { start: [x, y], moved }
+
+  const midpoint = () => {
+    const [a, b] = [...pointers.values()];
+    return { x: (a[0] + b[0]) / 2, y: (a[1] + b[1]) / 2, d: Math.hypot(a[0] - b[0], a[1] - b[1]) };
+  };
+
+  canvas.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    canvas.setPointerCapture(e.pointerId);
+    canvas.style.cursor = ''; // let the grab/grabbing cursor from CSS show
+    pointers.set(e.pointerId, local(e));
+    if (pointers.size === 1) gesture = { start: local(e), moved: false };
+    else if (gesture) gesture.moved = true; // a second finger: a pinch, not a tap
+  });
+
   canvas.addEventListener('pointermove', (e) => {
+    const p = local(e);
+    if (pointers.has(e.pointerId) && gesture) {
+      const before = pointers.size === 2 ? midpoint() : null;
+      const [ox, oy] = pointers.get(e.pointerId);
+      pointers.set(e.pointerId, p);
+      if (!gesture.moved && Math.hypot(p[0] - gesture.start[0], p[1] - gesture.start[1]) > DRAG_THRESHOLD) gesture.moved = true;
+      if (!gesture.moved) return;
+      hideTooltip();
+      canvas.classList.add('dragging');
+      if (before) {
+        const after = midpoint();
+        zoomAt(after.x, after.y, before.d ? after.d / before.d : 1);
+        panBy(after.x - before.x, after.y - before.y);
+      } else if (pointers.size === 1) {
+        panBy(p[0] - ox, p[1] - oy);
+      }
+      return;
+    }
     if (e.pointerType !== 'mouse') return;
-    const n = hitTest(...local(e));
+    const n = hitTest(...p);
     canvas.style.cursor = n && linkProfiles ? 'pointer' : '';
     if (n) showTooltip(n, false);
     else hideTooltip();
   });
+
+  function endPointer(e) {
+    pointers.delete(e.pointerId);
+    if (!pointers.size) {
+      gesture = null;
+      canvas.classList.remove('dragging');
+    }
+  }
+  canvas.addEventListener('pointercancel', endPointer);
   canvas.addEventListener('pointerleave', (e) => {
-    if (e.pointerType === 'mouse') hideTooltip();
+    if (e.pointerType === 'mouse' && !pointers.size) hideTooltip();
   });
+
+  // Ctrl + scroll (which is also what a trackpad pinch sends) zooms; a plain
+  // scroll keeps scrolling the page, except in fullscreen where there is none.
+  canvas.addEventListener('wheel', (e) => {
+    if (!e.ctrlKey && !e.metaKey && !document.fullscreenElement) return;
+    e.preventDefault();
+    zoomAt(...local(e), Math.exp(-e.deltaY * 0.002));
+  }, { passive: false });
+
+  canvas.addEventListener('dblclick', fit);
+
   canvas.addEventListener('pointerup', (e) => {
+    const tap = gesture && !gesture.moved;
+    endPointer(e);
+    if (!tap) return;
     const n = hitTest(...local(e));
     if (e.pointerType === 'mouse') {
       if (n && linkProfiles) window.open(profileUrl(n.login), '_blank', 'noopener');
@@ -578,5 +741,7 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     setLinkProfiles(on) {
       linkProfiles = on;
     },
+    fit,
+    zoomBy: (factor) => zoomAt(width / 2, height / 2, factor),
   };
 }

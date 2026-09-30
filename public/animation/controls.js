@@ -77,6 +77,11 @@ export function mountWatch(section) {
   skipBtn.addEventListener('click', () => player.skipToEnd());
   speedSelect.addEventListener('change', () => player.setSpeed(Number(speedSelect.value)));
   hubsToggle.addEventListener('change', () => renderer.setHubLabels(hubsToggle.checked));
+  const zoomIn = () => renderer.zoomBy(1.4);
+  const zoomOut = () => renderer.zoomBy(1 / 1.4);
+  $('watch-zoom-in').addEventListener('click', zoomIn);
+  $('watch-zoom-out').addEventListener('click', zoomOut);
+  $('watch-fit').addEventListener('click', () => renderer.fit());
 
   function toggleFullscreen() {
     if (document.fullscreenElement) document.exitFullscreen();
@@ -97,6 +102,10 @@ export function mountWatch(section) {
       ArrowRight: () => player.stepRound(),
       r: () => player.restart(),
       f: toggleFullscreen,
+      '+': zoomIn,
+      '=': zoomIn,
+      '-': zoomOut,
+      0: () => renderer.fit(),
       Escape: () => document.fullscreenElement && document.exitFullscreen(),
     };
     const action = actions[e.key.length === 1 ? e.key.toLowerCase() : e.key];

@@ -248,14 +248,50 @@ button {
 }
 
 .graph-wrap {
-  overflow-x: auto;
+  position: relative;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface);
   padding: 8px;
 }
 
-#graph { display: block; }
+/* The whole graph fits the box; pan and zoom move the viewBox (app.js). */
+#graph {
+  display: block;
+  width: 100%;
+  height: clamp(240px, 45vw, 340px);
+  cursor: grab;
+  touch-action: pan-x pan-y;
+}
+
+#graph.dragging { cursor: grabbing; }
+
+.graph-zoom {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+}
+
+.graph-zoom button {
+  min-width: 34px;
+  padding: 5px 10px;
+  font-size: 0.85rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.graph-zoom button:hover { border-color: var(--accent); color: var(--accent); }
+
+.graph-hint {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-align: center;
+}
 
 .explore-line { stroke: var(--line); stroke-width: 1; }
 .path-line { stroke: var(--accent); stroke-width: 3; }
@@ -384,8 +420,16 @@ footer {
   width: 100%;
   height: clamp(260px, 56vw, 70vh);
   border-radius: 10px;
-  touch-action: manipulation;
+  cursor: grab;
+  /* One finger scrolls the page, two fingers pan and zoom the canvas. */
+  touch-action: pan-x pan-y;
 }
+
+#watch-canvas.dragging { cursor: grabbing; }
+.watch-stage:fullscreen #watch-canvas { touch-action: none; }
+
+.watch-zoom { display: inline-flex; gap: 4px; }
+.watch-controls .watch-zoom button { min-width: 36px; padding-inline: 10px; }
 
 .watch-tooltip {
   position: absolute;

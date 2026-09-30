@@ -354,9 +354,8 @@ function renderGraph(result, linkProfiles) {
   const link = (href, cls, inner) => (linkProfiles
     ? `<a href="${esc(href)}" target="_blank" rel="noopener"${cls ? ` class="${cls}"` : ''}>${inner}</a>`
     : `<g${cls ? ` class="${cls}"` : ''}>${inner}</g>`);
-  graphSvg.setAttribute('viewBox', `0 0 ${svgW} ${svgH}`);
-  graphSvg.setAttribute('width', svgW);
-  graphSvg.setAttribute('height', svgH);
+  graphView.base = { x: 0, y: 0, w: svgW, h: svgH };
+  fitGraph();
 
   const parts = [];
   parts.push(
@@ -424,6 +423,115 @@ function renderGraph(result, linkProfiles) {
   });
 
   graphSvg.innerHTML = parts.join('');
+}
+
+// ---- Pan and zoom for the result graph ----
+// The graph starts fitted to its box. Drag pans, Ctrl + scroll or a pinch
+// zooms, and double-click or "Fit" goes back. It only moves the viewBox.
+
+const GRAPH_MIN_ZOOM = 0.5;
+const GRAPH_MAX_ZOOM = 8;
+const graphView = { base: { x: 0, y: 0, w: 420, h: 340 }, vb: null };
+
+function setViewBox(vb) {
+  graphView.vb = vb;
+  graphSvg.setAttribute('viewBox', `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+}
+
+function fitGraph() {
+  setViewBox({ ...graphView.base });
+}
+
+// Zooms by `factor` around a point on screen, keeping that point still.
+function zoomGraph(clientX, clientY, factor) {
+  const { vb, base } = graphView;
+  const zoom = base.w / vb.w;
+  const f = Math.min(GRAPH_MAX_ZOOM, Math.max(GRAPH_MIN_ZOOM, zoom * factor)) / zoom;
+  const p = new DOMPoint(clientX, clientY).matrixTransform(graphSvg.getScreenCTM().inverse());
+  setViewBox({ x: p.x - (p.x - vb.x) / f, y: p.y - (p.y - vb.y) / f, w: vb.w / f, h: vb.h / f });
+}
+
+function zoomGraphCenter(factor) {
+  const r = graphSvg.getBoundingClientRect();
+  zoomGraph(r.left + r.width / 2, r.top + r.height / 2, factor);
+}
+
+function panGraph(dx, dy) {
+  const scale = graphSvg.getScreenCTM().a; // screen pixels per viewBox unit
+  const { vb } = graphView;
+  setViewBox({ ...vb, x: vb.x - dx / scale, y: vb.y - dy / scale });
+}
+
+{
+  const pointers = new Map(); // pointerId -> [clientX, clientY]
+  let gesture = null; // { start, moved }
+  let swallowClick = false;
+  const midpoint = () => {
+    const [a, b] = [...pointers.values()];
+    return { x: (a[0] + b[0]) / 2, y: (a[1] + b[1]) / 2, d: Math.hypot(a[0] - b[0], a[1] - b[1]) };
+  };
+
+  graphSvg.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    swallowClick = false;
+    pointers.set(e.pointerId, [e.clientX, e.clientY]);
+    if (pointers.size === 1) gesture = { start: [e.clientX, e.clientY], moved: false };
+    else if (gesture) gesture.moved = true;
+  });
+
+  graphSvg.addEventListener('pointermove', (e) => {
+    if (!gesture || !pointers.has(e.pointerId)) return;
+    const before = pointers.size === 2 ? midpoint() : null;
+    const [ox, oy] = pointers.get(e.pointerId);
+    pointers.set(e.pointerId, [e.clientX, e.clientY]);
+    if (!gesture.moved) {
+      if (Math.hypot(e.clientX - gesture.start[0], e.clientY - gesture.start[1]) <= 4) return;
+      gesture.moved = true;
+    }
+    // Capture only once it's a drag, so a plain click still reaches the links.
+    if (!graphSvg.hasPointerCapture(e.pointerId)) graphSvg.setPointerCapture(e.pointerId);
+    graphSvg.classList.add('dragging');
+    if (before) {
+      const after = midpoint();
+      zoomGraph(after.x, after.y, before.d ? after.d / before.d : 1);
+      panGraph(after.x - before.x, after.y - before.y);
+    } else {
+      panGraph(e.clientX - ox, e.clientY - oy);
+    }
+  });
+
+  const endPointer = (e) => {
+    if (gesture?.moved) swallowClick = true;
+    pointers.delete(e.pointerId);
+    if (!pointers.size) {
+      gesture = null;
+      graphSvg.classList.remove('dragging');
+    }
+  };
+  graphSvg.addEventListener('pointerup', endPointer);
+  graphSvg.addEventListener('pointercancel', endPointer);
+
+  // A drag that ends over a profile link must not open it.
+  graphSvg.addEventListener('click', (e) => {
+    if (!swallowClick) return;
+    swallowClick = false;
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
+
+  graphSvg.addEventListener('wheel', (e) => {
+    if (!e.ctrlKey && !e.metaKey) return;
+    e.preventDefault();
+    zoomGraph(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.002));
+  }, { passive: false });
+
+  graphSvg.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    fitGraph();
+  });
+  document.getElementById('graph-zoom-in').addEventListener('click', () => zoomGraphCenter(1.4));
+  document.getElementById('graph-zoom-out').addEventListener('click', () => zoomGraphCenter(1 / 1.4));
+  document.getElementById('graph-fit').addEventListener('click', fitGraph);
 }
 
 function renderStats(result, demo) {
