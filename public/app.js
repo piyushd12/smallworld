@@ -1,5 +1,7 @@
 import { findConnection, SearchError } from './search.js';
 import { parseShareQuery, buildShareQuery } from './share.js';
+import { mountWatch } from './animation/controls.js';
+import { createDemoFetch, DEMO_PAIR } from './animation/demo-graph.js';
 
 const form = document.getElementById('search-form');
 const sourceInput = document.getElementById('source');
@@ -19,8 +21,13 @@ const tokenWarning = document.getElementById('token-warning');
 const sharedNote = document.getElementById('shared-note');
 const copyBtn = document.getElementById('copy-link');
 const nativeShareBtn = document.getElementById('native-share');
+const demoBtn = document.getElementById('demo-btn');
+const animateToggle = document.getElementById('animate');
+const replayBtn = document.getElementById('replay-btn');
+const watch = mountWatch(document.getElementById('watch'));
 
 let controller = null;
+let lastRun = null; // { timeline, demo } of the result on screen, for "Replay search"
 let maxPagesTouched = false;
 maxPagesInput.addEventListener('input', () => { maxPagesTouched = true; });
 
@@ -80,38 +87,97 @@ function updateStatus({ degree, checked, requests, cacheHits, remaining }) {
     `Searching degree ${degree}… ${checked} users checked, ${requests} GitHub requests (${cacheHits} more from cache)${rate}.`;
 }
 
-form.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const source = normalizeUsername(sourceInput.value);
-  const target = normalizeUsername(targetInput.value);
-  if (!source || !target) return;
+const smoothScroll = (el) => el.scrollIntoView({
+  behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+  block: 'start',
+});
 
-  const mode = form.mode.value;
-  const maxDegrees = Number(maxDegreesInput.value) || 6;
-  const maxPages = Number(maxPagesInput.value) || 1;
-
+// Runs one search. With "Animate search" on, the result is shown once the
+// animation has played out, then the page scrolls down to it.
+async function runSearch({ source, target, mode, maxDegrees, maxPages, fetchJson, demo = false }) {
+  const animate = animateToggle.checked;
   controller = new AbortController();
   findBtn.disabled = true;
+  demoBtn.disabled = true;
   stopBtn.hidden = false;
   resetUI();
+  if (animate) {
+    watch.startLive({ linkProfiles: !demo });
+    smoothScroll(document.getElementById('watch'));
+  } else {
+    watch.hide();
+  }
 
   try {
     const result = await findConnection(source, target, {
-      fetchJson: makeFetchJson(),
+      fetchJson,
       mode,
       maxDegrees,
       maxPages,
       signal: controller.signal,
       onProgress: updateStatus,
+      onEvent: animate ? watch.push : undefined,
     });
-    handleResult(result, mode);
+    const show = () => {
+      handleResult(result, mode, demo);
+      if (animate) smoothScroll(resultSection.hidden ? errorBox : resultSection);
+    };
+    if (animate) {
+      statusLine.textContent = 'Search finished, finishing the animation…';
+      watch.whenDone(show);
+    } else {
+      show();
+    }
   } catch (err) {
     handleError(err);
   } finally {
     findBtn.disabled = false;
+    demoBtn.disabled = false;
     stopBtn.hidden = true;
     controller = null;
   }
+}
+
+form.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const source = normalizeUsername(sourceInput.value);
+  const target = normalizeUsername(targetInput.value);
+  if (!source || !target) return;
+  runSearch({
+    source,
+    target,
+    mode: form.mode.value,
+    maxDegrees: Number(maxDegreesInput.value) || 6,
+    maxPages: Number(maxPagesInput.value) || 1,
+    fetchJson: makeFetchJson(),
+  });
+});
+
+// Demo mode: the real search, run against a made-up network in the browser,
+// so it works in a presentation with no network and no token.
+demoBtn.addEventListener('click', () => {
+  animateToggle.checked = true;
+  runSearch({
+    source: DEMO_PAIR.source,
+    target: DEMO_PAIR.target,
+    mode: 'either',
+    maxDegrees: 6,
+    maxPages: 3,
+    fetchJson: createDemoFetch(),
+    demo: true,
+  });
+});
+
+replayBtn.addEventListener('click', () => {
+  if (!lastRun) {
+    // A shared link has no recorded search, so run it for real.
+    animateToggle.checked = true;
+    form.requestSubmit();
+    return;
+  }
+  watch.replay(lastRun.timeline, { linkProfiles: !lastRun.demo });
+  smoothScroll(document.getElementById('watch'));
+  watch.whenDone(() => smoothScroll(resultSection));
 });
 
 stopBtn.addEventListener('click', () => {
@@ -131,7 +197,7 @@ function handleError(err) {
   }
 }
 
-function handleResult(result, mode) {
+function handleResult(result, mode, demo) {
   statusLine.hidden = true;
   if (result.status === 'same') {
     showError('Source and target are the same user.');
@@ -145,7 +211,7 @@ function handleResult(result, mode) {
     showError(notFoundMessage(result));
     return;
   }
-  renderFound(result, mode);
+  renderFound(result, mode, demo);
 }
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
@@ -186,13 +252,20 @@ function notFoundMessage(result) {
   }
 }
 
-function renderFound(result, mode) {
+// `demo` results are made-up people: nothing links to GitHub or gets shared.
+function renderFound(result, mode, demo = false) {
   resultSection.hidden = false;
   const between = result.degrees - 1;
   headlineEl.textContent = `@${result.source} is ${result.degrees} degrees from @${result.target} (${between} people in between)`;
-  renderChain(result);
-  renderGraph(result);
-  renderStats(result);
+  renderChain(result, !demo);
+  renderGraph(result, !demo);
+  renderStats(result, demo);
+
+  lastRun = result.timeline ? { timeline: result.timeline, demo } : null;
+  replayBtn.hidden = false;
+  replayBtn.textContent = lastRun ? 'Replay search' : 'Watch it search';
+  for (const el of document.querySelectorAll('#share > :not(#replay-btn)')) el.hidden = demo;
+  if (demo) return;
   renderSharePanel(result, mode);
 }
 
@@ -209,15 +282,17 @@ function directionLabel(d) {
   return '→';
 }
 
-function renderChain(result) {
+function renderChain(result, linkProfiles) {
   chainEl.innerHTML = '';
   result.path.forEach((login, i) => {
     const info = result.nodesInfo.get(login) || {};
-    const card = document.createElement('a');
+    const card = document.createElement(linkProfiles ? 'a' : 'span');
     card.className = 'card';
-    card.href = info.html_url || `https://github.com/${login}`;
-    card.target = '_blank';
-    card.rel = 'noopener';
+    if (linkProfiles) {
+      card.href = info.html_url || `https://github.com/${login}`;
+      card.target = '_blank';
+      card.rel = 'noopener';
+    }
     const img = document.createElement('img');
     img.src = info.avatar_url || '';
     img.alt = '';
@@ -273,8 +348,12 @@ function buildLayout(result) {
   return { degrees, svgW, svgH, pos, columns };
 }
 
-function renderGraph(result) {
+function renderGraph(result, linkProfiles) {
   const { svgW, svgH, pos, columns } = buildLayout(result);
+  // Made-up demo users have no profile, so their dots aren't links.
+  const link = (href, cls, inner) => (linkProfiles
+    ? `<a href="${esc(href)}" target="_blank" rel="noopener"${cls ? ` class="${cls}"` : ''}>${inner}</a>`
+    : `<g${cls ? ` class="${cls}"` : ''}>${inner}</g>`);
   graphSvg.setAttribute('viewBox', `0 0 ${svgW} ${svgH}`);
   graphSvg.setAttribute('width', svgW);
   graphSvg.setAttribute('height', svgH);
@@ -318,47 +397,47 @@ function renderGraph(result) {
     for (const n of others) {
       const p = pos.get(n.login);
       if (!p) continue;
-      const href = esc(n.html_url || `https://github.com/${n.login}`);
-      parts.push(
-        `<a href="${href}" target="_blank" rel="noopener" class="dot-link">` +
-          `<g transform="translate(${p.x - 10}, ${p.y - 10})" class="dot-group">` +
+      parts.push(link(
+        n.html_url || `https://github.com/${n.login}`,
+        'dot-link',
+        `<g transform="translate(${p.x - 10}, ${p.y - 10})" class="dot-group">` +
           '<title>@' + esc(n.login) + '</title>' +
           '<circle cx="10" cy="10" r="11" class="dot-ring"></circle>' +
           `<image href="${esc(n.avatar_url || '')}" width="20" height="20" clip-path="url(#smallAvatarClip)"></image>` +
-          '</g>' +
-          '</a>',
-      );
+          '</g>',
+      ));
     }
   }
 
   result.path.forEach((login) => {
     const p = pos.get(login);
     const info = result.nodesInfo.get(login) || {};
-    const href = esc(info.html_url || `https://github.com/${login}`);
-    parts.push(
-      `<a href="${href}" target="_blank" rel="noopener">` +
-        `<g transform="translate(${p.x - 18}, ${p.y - 18})">` +
+    parts.push(link(
+      info.html_url || `https://github.com/${login}`,
+      '',
+      `<g transform="translate(${p.x - 18}, ${p.y - 18})">` +
         '<circle cx="18" cy="18" r="19" class="avatar-ring"></circle>' +
         `<image href="${esc(info.avatar_url || '')}" width="36" height="36" clip-path="url(#avatarClip)"></image>` +
         '</g>' +
-        `<text x="${p.x}" y="${p.y + 34}" class="avatar-label" text-anchor="middle">@${esc(login)}</text>` +
-        '</a>',
-    );
+        `<text x="${p.x}" y="${p.y + 34}" class="avatar-label" text-anchor="middle">@${esc(login)}</text>`,
+    ));
   });
 
   graphSvg.innerHTML = parts.join('');
 }
 
-function renderStats(result) {
+function renderStats(result, demo) {
   statsEl.innerHTML = '';
   statsEl.hidden = !result.stats;
   if (!result.stats) return;
-  const items = [
-    `${result.stats.explored} users explored`,
-    `${result.stats.requests} GitHub requests used`,
-    `${result.stats.cacheHits} answered from cache`,
-    `${(result.stats.ms / 1000).toFixed(1)}s`,
-  ];
+  const items = demo
+    ? [`${result.stats.explored} users explored`, 'Demo network, no GitHub requests', `${(result.stats.ms / 1000).toFixed(1)}s`]
+    : [
+      `${result.stats.explored} users explored`,
+      `${result.stats.requests} GitHub requests used`,
+      `${result.stats.cacheHits} answered from cache`,
+      `${(result.stats.ms / 1000).toFixed(1)}s`,
+    ];
   for (const text of items) {
     const li = document.createElement('li');
     li.textContent = text;

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { findConnection, SearchError } from '../public/search.js';
+import { createDemoFetch, DEMO_PAIR } from '../public/animation/demo-graph.js';
 
 // Builds a fake `fetchJson` over a small following-graph. `following` maps a
 // login to the list of logins it follows; followers are derived by reversal.
@@ -238,4 +239,103 @@ test('a limit-based miss reports the limits it was searched within', async () =>
   const result = await findConnection('alice', 'dave', { fetchJson, maxDegrees: 2, maxPages: 1 });
   assert.equal(result.reason, 'max_degrees');
   assert.deepEqual(result.limits, { maxDegrees: 2, maxPages: 1 });
+});
+
+// ---- Search events (the timeline the animation plays) ----
+
+async function demoSearch(opts = {}) {
+  const seen = [];
+  const result = await findConnection(DEMO_PAIR.source, DEMO_PAIR.target, {
+    fetchJson: createDemoFetch({ delayMs: 0 }),
+    maxPages: 3,
+    onEvent: (ev) => seen.push(ev),
+    ...opts,
+  });
+  return { result, events: result.timeline, seen };
+}
+
+test('events: the timeline starts with start, ends with end, and is what onEvent saw', async () => {
+  const { result, events, seen } = await demoSearch();
+  assert.equal(result.status, 'found');
+  assert.deepEqual(events[0], {
+    type: 'start', t: events[0].t, source: DEMO_PAIR.source, target: DEMO_PAIR.target, mode: 'either', maxDegrees: 6,
+  });
+  assert.equal(events.at(-1).type, 'end');
+  assert.equal(events.at(-1).found, true);
+  assert.equal(events.at(-1).reason, 'found');
+  assert.deepEqual(seen, events);
+  for (let i = 1; i < events.length; i++) {
+    assert.equal(typeof events[i].t, 'number');
+    assert.ok(events[i].t >= events[i - 1].t, 'timestamps never go back');
+  }
+});
+
+test('events: every discovered node\'s parent was discovered earlier, one level up', async () => {
+  const { events } = await demoSearch();
+  const depthOf = { source: new Map(), target: new Map() };
+  for (const ev of events.filter((e) => e.type === 'discover')) {
+    if (ev.depth === 0) {
+      assert.equal(ev.parent, null);
+    } else {
+      assert.ok(depthOf[ev.side].has(ev.parent), `parent of ${ev.login} was seen before it`);
+      assert.equal(ev.depth, depthOf[ev.side].get(ev.parent) + 1);
+      assert.deepEqual([ev.edge.from, ev.edge.to].sort(), [ev.parent, ev.login].sort());
+    }
+    assert.ok(!depthOf[ev.side].has(ev.login), 'each node is discovered once per side');
+    depthOf[ev.side].set(ev.login, ev.depth);
+  }
+});
+
+test('events: meet comes before path, and the path matches the result', async () => {
+  const { result, events } = await demoSearch();
+  const meetAt = events.findIndex((e) => e.type === 'meet');
+  const pathAt = events.findIndex((e) => e.type === 'path');
+  assert.ok(meetAt > 0 && pathAt > meetAt);
+  const meet = events[meetAt];
+  assert.equal(meet.sourceDepth + meet.targetDepth, result.degrees);
+  assert.ok(result.path.includes(meet.login));
+  assert.deepEqual(events[pathAt].logins, result.path);
+  assert.deepEqual(events[pathAt].edges, result.hops);
+  assert.equal(result.degrees, DEMO_PAIR.degrees);
+});
+
+test('events: each round expands the side the cost rule picks', async () => {
+  const { events } = await demoSearch();
+  // Frontier sizes rebuilt from the discoveries: a side's frontier is
+  // everyone it found at its newest depth.
+  const perDepth = { source: new Map(), target: new Map() };
+  const depth = { source: 0, target: 0 };
+  const frontier = (side) => perDepth[side].get(depth[side]) ?? 0;
+  const rounds = [];
+  for (const ev of events) {
+    if (ev.type === 'discover') perDepth[ev.side].set(ev.depth, (perDepth[ev.side].get(ev.depth) ?? 0) + 1);
+    if (ev.type !== 'round') continue;
+    rounds.push(ev);
+    const other = ev.side === 'source' ? 'target' : 'source';
+    assert.equal(ev.frontierSize, frontier(ev.side));
+    assert.equal(ev.estimatedCost, frontier(ev.side));
+    assert.equal(ev.otherSideCost, frontier(other));
+    const expected = frontier('source') <= frontier('target') ? 'source' : 'target';
+    assert.equal(ev.side, expected, `round ${ev.round} picks the smaller frontier (ties go to the source)`);
+    assert.equal(ev.depth, depth[ev.side] + 1);
+    depth[ev.side] = ev.depth;
+  }
+  assert.ok(rounds.length >= 3);
+  assert.deepEqual(rounds.map((r) => r.round), rounds.map((_, i) => i + 1));
+  assert.ok(rounds.some((r) => r.side === 'target'), 'both sides get a turn');
+});
+
+test('events: a search that finds no chain still ends with a reason', async () => {
+  const { result, events } = await demoSearch({ maxDegrees: 2 });
+  assert.equal(result.status, 'not_found');
+  const end = events.at(-1);
+  assert.deepEqual([end.type, end.found, end.reason, end.detail], ['end', false, 'max-degrees', 'max_degrees']);
+  assert.ok(!events.some((e) => e.type === 'meet' || e.type === 'path'));
+});
+
+test('events: a thrown error still emits end before rethrowing', async () => {
+  const seen = [];
+  const fetchJson = async () => ({ status: 401, data: {}, remaining: null, reset: null });
+  await assert.rejects(() => findConnection('alice', 'dave', { fetchJson, onEvent: (e) => seen.push(e) }));
+  assert.deepEqual([seen[0].type, seen.at(-1).type, seen.at(-1).reason], ['start', 'end', 'error']);
 });

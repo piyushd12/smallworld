@@ -63,11 +63,55 @@
     <div class="actions">
       <button type="submit" id="find-btn">Find connection</button>
       <button type="button" id="stop-btn" hidden>Stop</button>
+      <button type="button" id="demo-btn" title="Run the search on a made-up network of 2,000 people, no GitHub needed">Demo</button>
+      <label class="animate-toggle"><input type="checkbox" id="animate" checked> Animate search</label>
     </div>
   </form>
 
   <p id="status-line" class="status-line" hidden></p>
   <div id="error-box" class="banner banner-error" hidden></div>
+
+  <section id="watch" class="watch" hidden aria-label="Search animation">
+    <div id="watch-stage" class="watch-stage">
+      <ul class="watch-legend">
+        <li><i class="swatch swatch-source"></i><b id="watch-name-source">Source</b> <span id="watch-count-source" class="legend-count"></span></li>
+        <li><i class="swatch swatch-target"></i><b id="watch-name-target">Target</b> <span id="watch-count-target" class="legend-count"></span></li>
+        <li><i class="swatch swatch-path"></i>Chain</li>
+        <li><i class="swatch swatch-ring"></i>Frontier (the ring being searched)</li>
+      </ul>
+      <div class="watch-canvas-wrap">
+        <canvas id="watch-canvas" role="img" aria-label="Two searches spreading out from the source and the target until they meet"></canvas>
+        <div id="watch-tooltip" class="watch-tooltip" hidden></div>
+      </div>
+      <p id="watch-caption" class="watch-caption" aria-live="polite"></p>
+      <div class="watch-controls">
+        <button type="button" id="watch-play" aria-pressed="true">❚❚ Pause</button>
+        <button type="button" id="watch-step">⏭ Next round</button>
+        <label class="watch-speed">Speed
+          <select id="watch-speed">
+            <option value="0.5">0.5×</option>
+            <option value="1" selected>1×</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+          </select>
+        </label>
+        <button type="button" id="watch-restart">↺ Replay</button>
+        <button type="button" id="watch-skip">⏩ Skip to result</button>
+        <button type="button" id="watch-fullscreen">⤢ Fullscreen</button>
+        <label class="watch-toggle"><input type="checkbox" id="watch-hubs" checked> Hub labels</label>
+        <details class="kbd-help">
+          <summary aria-label="Keyboard shortcuts">?</summary>
+          <ul>
+            <li><kbd>Space</kbd> play / pause</li>
+            <li><kbd>→</kbd> next round</li>
+            <li><kbd>R</kbd> replay</li>
+            <li><kbd>F</kbd> fullscreen</li>
+            <li><kbd>Esc</kbd> exit fullscreen</li>
+          </ul>
+        </details>
+      </div>
+    </div>
+  </section>
 
   <section id="result" hidden>
     <p id="shared-note" class="shared-note" hidden>
@@ -81,6 +125,7 @@
     </div>
     <ul id="stats" class="stats"></ul>
     <div id="share" class="share">
+      <button type="button" id="replay-btn" hidden>Replay search</button>
       <button type="button" id="copy-link">Copy link</button>
       <button type="button" id="native-share" hidden>Share</button>
       <a id="share-x" class="button" target="_blank" rel="noopener">Post on X</a>

@@ -12,6 +12,9 @@
   --error-text: #9b1c1c;
   --dot: #9aa3b2;
   --line: #c7cdd6;
+  --wave-source: #2563eb;
+  --wave-target: #ea580c;
+  --path: #c026d3;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -29,6 +32,9 @@
     --error-text: #ff8a8a;
     --dot: #5b6270;
     --line: #343a45;
+    --wave-source: #5b8cff;
+    --wave-target: #fb923c;
+    --path: #e879f9;
   }
 }
 
@@ -149,8 +155,27 @@ summary {
 
 .actions {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 10px;
   margin-top: 18px;
+}
+
+#demo-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+#demo-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+label.animate-toggle {
+  flex: none;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  color: var(--text);
 }
 
 button {
@@ -310,3 +335,177 @@ footer {
 .share .button:hover { border-color: var(--accent); color: var(--accent); }
 
 .share [hidden], .shared-note[hidden], .stats[hidden] { display: none; }
+
+/* ---- Watch the search ---- */
+
+.watch { margin-top: 24px; }
+
+.watch-stage {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.watch-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.watch-legend li { display: flex; align-items: center; gap: 6px; }
+.watch-legend b { color: var(--text); font-weight: 600; }
+
+.swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.swatch-source { background: var(--wave-source); }
+.swatch-target { background: var(--wave-target); }
+.swatch-path { background: var(--path); border-radius: 3px; height: 4px; width: 16px; }
+.swatch-ring { border: 1.5px dashed var(--muted); }
+
+.watch-canvas-wrap { position: relative; }
+
+#watch-canvas {
+  display: block;
+  width: 100%;
+  height: clamp(260px, 56vw, 70vh);
+  border-radius: 10px;
+  touch-action: manipulation;
+}
+
+.watch-tooltip {
+  position: absolute;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 260px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.85rem;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.18);
+  pointer-events: none;
+}
+
+.watch-tooltip[hidden] { display: none; }
+.watch-tooltip span { color: var(--muted); }
+.watch-tooltip a { color: var(--accent); pointer-events: auto; }
+
+.watch-caption {
+  margin: 0;
+  min-height: 3em;
+  font-size: 1.05rem;
+  line-height: 1.45;
+}
+
+.watch-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.watch-controls button,
+.watch-controls select {
+  padding: 7px 12px;
+  font-size: 0.9rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+}
+
+.watch-controls button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.watch-controls button:disabled { opacity: 0.5; cursor: default; }
+.watch-controls select { background: var(--bg); }
+.watch-controls button[hidden] { display: none; }
+
+.watch-controls label {
+  flex: none;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+}
+
+.kbd-help { position: relative; }
+
+.kbd-help summary {
+  list-style: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  color: var(--muted);
+}
+
+.kbd-help summary::-webkit-details-marker { display: none; }
+
+.kbd-help ul {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 2;
+  margin: 0;
+  padding: 10px 14px;
+  list-style: none;
+  white-space: nowrap;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.18);
+  font-size: 0.85rem;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 1.8em;
+  padding: 1px 6px;
+  margin-right: 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  font: inherit;
+  font-size: 0.8rem;
+  text-align: center;
+}
+
+/* Fullscreen for projectors: the canvas takes all the room the captions and
+   controls leave, and the text grows. */
+.watch-stage:fullscreen {
+  border: none;
+  border-radius: 0;
+  padding: 20px 28px;
+  background: var(--surface);
+}
+
+.watch-stage:fullscreen .watch-canvas-wrap { flex: 1; min-height: 0; }
+.watch-stage:fullscreen #watch-canvas { height: 100%; }
+.watch-stage:fullscreen .watch-caption { font-size: 1.6rem; }
+.watch-stage:fullscreen .watch-legend { font-size: 1.1rem; }
+
+@media (max-width: 640px) {
+  label.animate-toggle { margin-left: 0; }
+  .watch-stage { padding: 8px; }
+  .watch-caption { font-size: 0.95rem; }
+  #watch-canvas { height: clamp(260px, 90vw, 60vh); }
+}

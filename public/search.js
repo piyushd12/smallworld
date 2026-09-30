@@ -52,7 +52,55 @@ function sideSnapshot(side) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// How a search ended, in the coarse terms the animation narrates. The exact
+// internal reason travels alongside as `detail`.
+const END_REASONS = {
+  max_degrees: 'max-degrees',
+  rate_limit: 'rate-limit',
+  ip_limit: 'rate-limit',
+  budget: 'rate-limit',
+  aborted: 'stopped',
+  error: 'error',
+  dead_end: 'dead-end',
+  isolated: 'dead-end',
+  source_follows_nobody: 'dead-end',
+  target_has_no_followers: 'dead-end',
+};
+
+// Runs the search and records what it does as a list of events (the
+// timeline), passing each one to `onEvent` as it happens. The events only
+// report; they never change which chain is found.
 export async function findConnection(source, target, opts) {
+  const { onEvent = () => {}, mode = 'either', maxDegrees = 6 } = opts;
+  const startedAt = Date.now();
+  const timeline = [];
+  const emit = (type, data) => {
+    const event = { type, t: Date.now() - startedAt, ...data };
+    timeline.push(event);
+    onEvent(event);
+  };
+
+  emit('start', { source, target, mode, maxDegrees });
+  let result;
+  try {
+    result = await search(source, target, opts, emit);
+  } catch (err) {
+    const stopped = err?.code === 'aborted' || err?.name === 'AbortError';
+    emit('end', { found: false, reason: stopped ? 'stopped' : 'error', detail: err?.code ?? 'error', stats: null });
+    throw err;
+  }
+  const found = result.status === 'found';
+  emit('end', {
+    found,
+    reason: found ? 'found' : END_REASONS[result.reason] ?? 'error',
+    detail: result.reason ?? result.status,
+    stats: result.stats,
+  });
+  result.timeline = timeline;
+  return result;
+}
+
+async function search(source, target, opts, emit) {
   const {
     fetchJson,
     mode = 'either',
@@ -126,6 +174,9 @@ export async function findConnection(source, target, opts) {
 
   const sideS = initSide(srcUser.login, srcUser);
   const sideT = initSide(tgtUser.login, tgtUser);
+  for (const [side, u] of [['source', srcUser], ['target', tgtUser]]) {
+    emit('discover', { side, login: u.login, parent: null, depth: 0, avatarUrl: u.avatar_url, edge: null });
+  }
 
   function kindsFor(isSourceSide) {
     if (mode === 'chain') return isSourceSide ? ['following'] : ['followers'];
@@ -135,6 +186,7 @@ export async function findConnection(source, target, opts) {
   let meet = null;
   let reason = null;
   let stopInfo = {};
+  let round = 0;
 
   while (true) {
     if (sideS.depth + sideT.depth >= maxDegrees) { reason = 'max_degrees'; break; }
@@ -144,6 +196,17 @@ export async function findConnection(source, target, opts) {
     const expandSource = sideS.frontier.length <= sideT.frontier.length;
     const side = expandSource ? sideS : sideT;
     const other = expandSource ? sideT : sideS;
+    const sideName = expandSource ? 'source' : 'target';
+    // The cost is the number of people this side still has to check, the
+    // same number the choice above compares.
+    emit('round', {
+      round: ++round,
+      side: sideName,
+      depth: side.depth + 1,
+      frontierSize: side.frontier.length,
+      estimatedCost: side.frontier.length,
+      otherSideCost: other.frontier.length,
+    });
     side.depth += 1;
 
     const ordered = [...side.frontier].sort(
@@ -153,6 +216,7 @@ export async function findConnection(source, target, opts) {
     let roundStop = null;
 
     await runPool(ordered, concurrency, async (login) => {
+      emit('expand', { side: sideName, login, depth: side.depth - 1 });
       for (const kind of kindsFor(expandSource)) {
         let page = 1;
         while (page <= maxPages) {
@@ -194,6 +258,14 @@ export async function findConnection(source, target, opts) {
             if (!side.nodes.has(neighbor)) {
               side.nodes.set(neighbor, { avatar_url: u.avatar_url, html_url: u.html_url, depth: side.depth });
               side.parent.set(neighbor, login);
+              emit('discover', {
+                side: sideName,
+                login: neighbor,
+                parent: login,
+                depth: side.depth,
+                avatarUrl: u.avatar_url,
+                edge: kind === 'following' ? { from: login, to: neighbor } : { from: neighbor, to: login },
+              });
             }
           }
           if (items.length < 100) break;
@@ -246,6 +318,8 @@ export async function findConnection(source, target, opts) {
   for (let i = 0; i < path.length - 1; i++) {
     hops.push({ from: path[i], to: path[i + 1], direction: relation(path[i], path[i + 1], edges) });
   }
+  emit('meet', { login: meet.login, sourceDepth: sideS.nodes.get(meet.login).depth, targetDepth: sideT.nodes.get(meet.login).depth });
+  emit('path', { logins: path, edges: hops });
 
   const nodesInfo = new Map();
   for (const n of [...explored.source, ...explored.target]) {
