@@ -57,6 +57,7 @@
         <label>Max pages per follower list
           <input type="number" id="max-pages" min="1" max="10" value="3">
         </label>
+        <label class="radio"><input type="checkbox" id="alt-routes" checked> Extra search for alternative routes</label>
       </div>
     </details>
 
@@ -64,6 +65,11 @@
       <button type="submit" id="find-btn">Find connection</button>
       <button type="button" id="stop-btn" hidden>Stop</button>
       <button type="button" id="demo-btn" title="Run the search on a made-up network of 2,000 people, no GitHub needed">Demo</button>
+      <select id="demo-pick" aria-label="Which demo to run">
+        <option value="long">Long chain</option>
+        <option value="gatekeeper">Gatekeeper</option>
+        <option value="routes">Three routes</option>
+      </select>
       <label class="animate-toggle"><input type="checkbox" id="animate" checked> Animate search</label>
     </div>
   </form>
@@ -124,10 +130,14 @@
   <section id="result" hidden>
     <p id="shared-note" class="shared-note" hidden>
       Shared result, verified just now
-      <button type="button" id="search-again">Search again</button>
+      <button type="button" id="search-again">Find other routes</button>
     </p>
     <h2 id="headline"></h2>
-    <div id="chain" class="chain"></div>
+    <div id="routes" class="routes" hidden>
+      <p id="routes-summary" class="routes-summary"></p>
+      <p class="routes-note">Within the explored part of GitHub: accounts the search didn't reach may hold other routes.</p>
+    </div>
+    <div id="chains" class="chains" role="radiogroup" aria-label="Chains"></div>
     <div class="graph-wrap">
       <div class="graph-zoom" role="group" aria-label="Zoom the graph">
         <button type="button" id="graph-zoom-out" aria-label="Zoom out">−</button>
@@ -162,6 +172,16 @@
       configured maximum degrees, a single search spends at most 400 GitHub requests, and it stops entirely
       once the hourly rate limit runs out. When no chain is found, that means none was found within those
       limits — not that no connection exists.
+    </p>
+    <p>
+      There is often more than one shortest chain. The search keeps every link that leads one step closer
+      to either end, counts all the shortest chains from those links without listing them, and shows up
+      to three that share as few people as possible. Two chains are <em>independent routes</em> when no
+      one in between is on both. The most independent routes is found with a max-flow calculation, and by
+      Menger's theorem it equals the fewest people whose removal would cut the connection. When that is
+      one person, every route goes through them: they are the <em>gatekeeper</em>. If there are fewer
+      than three independent shortest routes, the search looks one degree further for alternatives.
+      All of this only covers the part of GitHub the search explored; other accounts may hold more routes.
     </p>
     <p>
       Every GitHub answer is cached on the server for days, so accounts that show up in many searches are

@@ -12,6 +12,8 @@ const FLASH_MS = 1000;
 const SEGMENT_MS = 420;
 const DIM_MS = 900;
 const DIMMED = 0.15;
+const GATE_PULSE_MS = 1100;
+const GATE_PULSES = 3;
 const HUBS_PER_SIDE = 6;
 const GRID = 24; // hit-test cell size, CSS pixels
 const VIEW_MS = 900;
@@ -64,7 +66,8 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
   let pulses;
   let glows;
   let meet;
-  let chain; // { nodes, segments, start }
+  let chains; // [{ nodes, segments, start, steps, color }], chain 1 first; color is a key of `colors`
+  let gates; // [{ node, start }]: gatekeepers to pulse
   let ringCap;
   let grid;
   let gridStale;
@@ -79,6 +82,7 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     const v = (name) => css.getPropertyValue(name).trim();
     colors = {
       source: v('--wave-source'), target: v('--wave-target'), path: v('--path'),
+      chain2: v('--chain-2'), chain3: v('--chain-3'),
       bg: v('--surface'), text: v('--text'), muted: v('--muted'), line: v('--line'),
     };
     dirty = true;
@@ -95,7 +99,8 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     pulses = [];
     glows = [];
     meet = null;
-    chain = null;
+    chains = [];
+    gates = [];
     ringCap = Math.floor(MAX_NODES / 6);
     grid = new Map();
     gridStale = false;
@@ -148,11 +153,11 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     setView({ k, x: width / 2 - ((minX + maxX) / 2) * k, y: height / 2 - ((minY + maxY) / 2) * k }, animate);
   }
 
-  const chainAndRoots = () => [...new Set([roots.source, roots.target, ...(chain?.nodes ?? [])].filter(Boolean))];
+  const chainAndRoots = () => [...new Set([roots.source, roots.target, ...chains.flatMap((c) => c.nodes)].filter(Boolean))];
 
   function fit() {
     userMoved = false;
-    fitView(chain ? chainAndRoots() : [...visible], true);
+    fitView(chains.length ? chainAndRoots() : [...visible], true);
   }
 
   // Zooms by `factor` around a point on screen, keeping that point still.
@@ -224,6 +229,26 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     return all.get(`${side}:${login}`);
   }
 
+  // A chain as drawable nodes and segments. People up to index m are drawn
+  // where the source's wave found them, the rest where the target's did.
+  function buildChain(logins, m, start, color) {
+    const nodes = logins.map((login, i) => {
+      const [first, second] = i <= m ? ['source', 'target'] : ['target', 'source'];
+      return nodeOf(first, login) ?? nodeOf(second, login);
+    }).filter(Boolean);
+    for (const n of nodes) {
+      n.pinned = true;
+      if (!n.shown) show(n);
+      loadImage(n.avatarUrl);
+    }
+    // Segments are drawn from both ends toward the meeting point.
+    const segments = [];
+    for (let i = 0; i < nodes.length - 1; i++) {
+      segments.push({ a: nodes[i], b: nodes[i + 1], order: i < m ? i : nodes.length - 2 - i, reverse: i >= m });
+    }
+    return { nodes, segments, start, steps: Math.max(m, nodes.length - 1 - m), color };
+  }
+
   function apply(ev) {
     const now = performance.now();
     switch (ev.type) {
@@ -265,26 +290,25 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
         busyFor(FLASH_MS);
         break;
       case 'path': {
-        const logins = ev.logins;
-        const m = meet ? logins.indexOf(meet.login) : logins.length - 1;
-        // The source half is drawn where the source wave found it, the target
-        // half where the target wave did; the meeting node is on both.
-        const nodes = logins.map((login, i) => nodeOf(i <= m ? 'source' : 'target', login)).filter(Boolean);
-        for (const n of nodes) {
-          n.pinned = true;
-          if (!n.shown) show(n);
-          loadImage(n.avatarUrl);
-        }
-        // Segments are drawn from both ends toward the meeting point.
-        const segments = [];
-        for (let i = 0; i < nodes.length - 1; i++) {
-          segments.push({ a: nodes[i], b: nodes[i + 1], order: i < m ? i : nodes.length - 2 - i, reverse: i >= m });
-        }
-        const steps = Math.max(m, nodes.length - 1 - m);
-        chain = { nodes, segments, start: now + duration(FLASH_MS * 0.6), steps };
-        busyFor(FLASH_MS * 0.6 + steps * SEGMENT_MS + DIM_MS);
+        const m = ev.meetIndex ?? (meet ? ev.logins.indexOf(meet.login) : ev.logins.length - 1);
+        chains = [buildChain(ev.logins, m, now + duration(FLASH_MS * 0.6), 'path')];
+        busyFor(FLASH_MS * 0.6 + chains[0].steps * SEGMENT_MS + DIM_MS);
         // The meeting point can be far out on a ring, off the canvas: frame
         // the whole chain unless the viewer has moved the view themselves.
+        if (!userMoved) fitView(chainAndRoots(), true);
+        break;
+      }
+      case 'chains': {
+        // Chain 1 came with 'path'; the others are drawn after it, one by one.
+        let next = chains.length ? chains.at(-1).start + duration(chains.at(-1).steps * SEGMENT_MS) : now;
+        ev.chains.slice(chains.length ? 1 : 0).forEach((c, i) => {
+          const chain = buildChain(c.logins, c.meetIndex, next, `chain${i + 2}`);
+          chains.push(chain);
+          next = chain.start + duration(chain.steps * SEGMENT_MS);
+        });
+        const shown = chains.flatMap((c) => c.nodes);
+        gates = ev.gatekeepers.map((login) => ({ node: shown.find((n) => n.login === login), start: next })).filter((g) => g.node);
+        busyFor(next - now + (gates.length ? GATE_PULSES * GATE_PULSE_MS : 0));
         if (!userMoved) fitView(chainAndRoots(), true);
         break;
       }
@@ -308,7 +332,7 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     for (const n of all.values()) place(n);
     // Positions moved with the new size, so the old pan/zoom no longer applies.
     userMoved = false;
-    if (chain) fitView(chainAndRoots(), false);
+    if (chains.length) fitView(chainAndRoots(), false);
     else setView(IDENTITY);
     gridStale = true;
     dirty = true;
@@ -323,7 +347,8 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     const base = px(Math.max(13, unit() / 28));
     return node.depth === 0 ? base : base * 0.78;
   };
-  const isBig = (node) => node.depth === 0 || (chain && chain.nodes.includes(node));
+  const chainOf = (node) => chains.find((c) => c.nodes.includes(node));
+  const isBig = (node) => node.depth === 0 || !!chainOf(node);
 
   function ellipse(side, r) {
     const e = layout.ring(side, r);
@@ -332,7 +357,7 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
   }
 
   function dimAt(t) {
-    return chain ? 1 - (1 - DIMMED) * progress(chain.start, DIM_MS, t) : 1;
+    return chains.length ? 1 - (1 - DIMMED) * progress(chains[0].start, DIM_MS, t) : 1;
   }
 
   function drawRings(t, dim) {
@@ -449,26 +474,43 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
   }
 
   function drawChain(t) {
-    if (!chain) return;
-    ctx.strokeStyle = colors.path;
     ctx.lineCap = 'round';
     ctx.lineWidth = px(Math.max(3, unit() / 220));
     ctx.globalAlpha = 1;
-    for (const s of chain.segments) {
-      const k = easeOut(progress(chain.start + s.order * duration(SEGMENT_MS), SEGMENT_MS, t));
-      if (k <= 0) continue;
-      // Grow each segment from the outer end toward the meeting point.
-      const [from, to] = s.reverse ? [s.b, s.a] : [s.a, s.b];
+    // Later chains go underneath, so chain 1 stays on top where they share a link.
+    for (const chain of [...chains].reverse()) {
+      ctx.strokeStyle = colors[chain.color];
+      for (const s of chain.segments) {
+        const k = easeOut(progress(chain.start + s.order * duration(SEGMENT_MS), SEGMENT_MS, t));
+        if (k <= 0) continue;
+        // Grow each segment from the outer end toward the meeting point.
+        const [from, to] = s.reverse ? [s.b, s.a] : [s.a, s.b];
+        ctx.beginPath();
+        ctx.moveTo(from.x, from.y);
+        ctx.lineTo(from.x + (to.x - from.x) * k, from.y + (to.y - from.y) * k);
+        ctx.stroke();
+      }
+    }
+  }
+
+  // A few rings spreading out from each gatekeeper once the chains are drawn.
+  function drawGates(t) {
+    for (const g of gates) {
+      const k = duration(GATE_PULSE_MS) ? (t - g.start) / GATE_PULSE_MS : GATE_PULSES - 1;
+      if (k < 0 || k >= GATE_PULSES) continue;
+      const f = k % 1;
+      ctx.globalAlpha = 0.8 * (1 - f);
+      ctx.strokeStyle = colors.path;
+      ctx.lineWidth = px(3);
       ctx.beginPath();
-      ctx.moveTo(from.x, from.y);
-      ctx.lineTo(from.x + (to.x - from.x) * k, from.y + (to.y - from.y) * k);
+      ctx.arc(g.node.x, g.node.y, avatarRadius(g.node) * (1.2 + 1.3 * easeOut(f)), 0, Math.PI * 2);
       ctx.stroke();
     }
   }
 
   function drawAvatar(n, t) {
     const r = avatarRadius(n);
-    const ring = chain && chain.nodes.includes(n) ? colors.path : colors[n.side];
+    const ring = colors[chainOf(n)?.color ?? n.side];
     const k = progress(n.born, FADE_MS, t);
     ctx.globalAlpha = k;
     ctx.fillStyle = ring;
@@ -521,6 +563,7 @@ export function createRenderer(canvas, { tooltip, tick = () => {} } = {}) {
     if (showHubs) drawHubLabels(dim);
     drawChain(t);
     drawMeetFlash(t);
+    drawGates(t);
     const big = [...visible].filter(isBig);
     for (const n of big) drawAvatar(n, t);
     ctx.globalAlpha = 1;

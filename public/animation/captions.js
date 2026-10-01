@@ -86,6 +86,10 @@ export function createCaptions({ caption, names, counters, now = () => performan
       case 'round': {
         summariseRound();
         state.round = { side: ev.side, depth: ev.depth };
+        if (ev.extra) {
+          say('Fewer than 3 independent routes so far, so the search looks one degree further for alternative routes.');
+          break;
+        }
         const mine = ev.estimatedCost;
         const theirs = ev.otherSideCost;
         const name = who(ev.side);
@@ -99,8 +103,13 @@ export function createCaptions({ caption, names, counters, now = () => performan
         summariseRound();
         say(`The waves met at @${ev.login}, so the chain is ${ev.sourceDepth + ev.targetDepth} degrees long.`);
         break;
+      case 'chains':
+        summariseRound();
+        if (ev.gatekeepers.length) say(`Every route goes through @${ev.gatekeepers[0]}.`);
+        else if (ev.chains.length > 1) say(`Here are ${ev.chains.length} different chains, drawn one after the other.`);
+        break;
       case 'end':
-        if (ev.found) break; // the meeting caption says it best
+        if (ev.found) break; // the meeting and chains captions say it best
         summariseRound();
         say(endCaption(ev));
         break;

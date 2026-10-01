@@ -4,6 +4,8 @@
 // links rewired to random people) plus a handful of popular hubs, which is
 // roughly how real social networks look.
 
+import { toGraph, maxDisjointRoutes } from '../paths.js';
+
 const FIRST = [
   'ada', 'ben', 'cleo', 'dev', 'esme', 'finn', 'gia', 'hugo', 'iris', 'jay',
   'kai', 'lena', 'milo', 'nia', 'omar', 'pia', 'quinn', 'rosa', 'sam', 'tara',
@@ -91,7 +93,51 @@ export function buildDemoGraph(seed = DEMO_SEED) {
     if (r < 0.3) { follow(a, b); follow(b, a); } else if (r < 0.65) follow(a, b); else follow(b, a);
   }
 
-  return { logins, following, followers, hubs: hubs.map((h) => logins[h]) };
+  const graph = { logins, following, followers, hubs: hubs.map((h) => logins[h]) };
+  addIsland(graph);
+  return graph;
+}
+
+// A small island whose only way out is one person, @nora-quill, for the
+// Gatekeeper demo. She links to three people two steps from the island
+// demo's target, each by a different middle person, so she is the only one
+// every route has to pass.
+export const ISLAND = { source: 'ola-brook', gatekeeper: 'nora-quill' };
+function addIsland(graph) {
+  const { logins, following, followers } = graph;
+  const target = logins.at(-1);
+  const both = (a, b) => {
+    for (const [x, y] of [[a, b], [b, a]]) {
+      following.get(x).push(y);
+      followers.get(y).push(x);
+    }
+  };
+  const island = ['ola-brook', 'pim-brook', 'ros-brook', 'tess-brook', ISLAND.gatekeeper];
+  for (const l of island) {
+    following.set(l, []);
+    followers.set(l, []);
+  }
+
+  const dist = distances(graph, target);
+  const near = (l) => [...following.get(l), ...followers.get(l)].filter((n) => dist.get(n) === 1);
+  const anchors = [];
+  const middles = new Set();
+  for (const l of logins) {
+    if (anchors.length === 3) break;
+    if (dist.get(l) !== 2 || near(l).some((m) => middles.has(m))) continue;
+    anchors.push(l);
+    for (const m of near(l)) middles.add(m);
+  }
+
+  both('ola-brook', 'pim-brook');
+  both('ola-brook', 'ros-brook');
+  both('tess-brook', 'ola-brook');
+  both('tess-brook', 'pim-brook');
+  both('pim-brook', ISLAND.gatekeeper);
+  both('ros-brook', ISLAND.gatekeeper);
+  for (const a of anchors) both(ISLAND.gatekeeper, a);
+  logins.push(...island);
+  ISLAND.target = target;
 }
 
 // Hops between two people when a follow in either direction counts.
@@ -121,6 +167,35 @@ export const DEMO_PAIR = (() => {
   const target = demoGraph.logins.find((l) => dist.get(l) === far);
   return { source, target, degrees: far };
 })();
+
+// The Three routes demo: someone 4 (or else 3) steps from the demo source
+// with at least three shortest chains that share no one in between.
+function routesPair(graph) {
+  const { source } = DEMO_PAIR;
+  const fromS = distances(graph, source);
+  for (const len of [4, 3]) {
+    for (const target of graph.logins) {
+      if (fromS.get(target) !== len) continue;
+      const toT = distances(graph, target);
+      const links = [];
+      for (const [a, list] of graph.following) {
+        for (const b of list) {
+          if (fromS.get(a) + toT.get(a) !== len || fromS.get(b) + toT.get(b) !== len) continue;
+          if (fromS.get(b) === fromS.get(a) + 1) links.push([a, b]);
+          else if (fromS.get(a) === fromS.get(b) + 1) links.push([b, a]);
+        }
+      }
+      if (maxDisjointRoutes(toGraph(links, true), source, target).count >= 3) return { source, target, degrees: len };
+    }
+  }
+  return DEMO_PAIR;
+}
+
+export const DEMO_PAIRS = {
+  long: DEMO_PAIR,
+  gatekeeper: { source: ISLAND.source, target: ISLAND.target, degrees: distances(demoGraph, ISLAND.source).get(ISLAND.target) },
+  routes: routesPair(demoGraph),
+};
 
 const avatars = new Map();
 // A coloured circle with the person's initials, as an inline SVG image.

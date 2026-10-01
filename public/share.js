@@ -10,8 +10,9 @@ export function isValidLogin(login) {
 
 export const MAX_VIA = 6;
 
-// searchParams -> { from, to, via: string[] | null, mode: 'either' | 'follow' },
-// or null when the link should be ignored (missing/invalid input).
+// searchParams -> { from, to, via: string[] | null, mode: 'either' | 'follow', gk? },
+// or null when the link should be ignored (missing/invalid input). `gk` is the
+// person every route went through; it's dropped unless it's one of `via`.
 export function parseShareQuery(params) {
   const from = params.get('from');
   const to = params.get('to');
@@ -26,14 +27,18 @@ export function parseShareQuery(params) {
     via = raw === '' ? [] : raw.split(',');
     if (via.length > MAX_VIA || !via.every(isValidLogin)) return null;
   }
+  const gk = params.get('gk');
+  if (via && isValidLogin(gk) && via.some((v) => v.toLowerCase() === gk.toLowerCase())) return { from, to, via, mode, gk };
   return { from, to, via, mode };
 }
 
 // Inverse of parseShareQuery. Also used as the normalised cache key for images.
 // A path with more than MAX_VIA middle people can't be shared, so `via` is dropped.
-export function buildShareQuery({ from, to, via, mode }) {
+export function buildShareQuery({ from, to, via, mode, gk }) {
   const p = new URLSearchParams({ from, to });
-  if (via && via.length <= MAX_VIA) p.set('via', via.join(','));
+  const viaOk = via && via.length <= MAX_VIA;
+  if (viaOk) p.set('via', via.join(','));
   if (mode === 'follow') p.set('mode', 'follow');
+  if (viaOk && gk && via.includes(gk)) p.set('gk', gk);
   return `?${p.toString().replaceAll('%2C', ',')}`;
 }

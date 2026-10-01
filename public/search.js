@@ -2,6 +2,11 @@
 // `fetchJson` function so it can run against the real API proxy in the
 // browser, or a mocked graph in tests.
 
+import { toGraph, maxDisjointRoutes, findGatekeepers, selectDiverseChains, disjointCount } from './paths.js';
+
+const CHAIN_SAMPLE = 500; // chains listed per length, as input for picking diverse ones
+const SHOWN_CHAINS = 3;
+
 export class SearchError extends Error {
   constructor(code, message) {
     super(message);
@@ -27,8 +32,80 @@ function initSide(rootLogin, rootInfo) {
     frontier: [rootLogin],
     nodes: new Map([[rootLogin, { ...rootInfo, depth: 0 }]]),
     parent: new Map([[rootLogin, null]]),
+    // Everyone one step closer to the root who links to this person, so the
+    // explored graph holds every shortest path, not just the first one found.
+    parents: new Map([[rootLogin, []]]),
     discoveredBy: new Map(),
   };
+}
+
+// Number of shortest paths from the side's root to `login`, by summing over
+// parents (memoised per side).
+function pathCounter(side) {
+  const memo = new Map();
+  const count = (login) => {
+    if (!memo.has(login)) {
+      const ps = side.parents.get(login);
+      memo.set(login, ps.length ? ps.reduce((n, p) => n + count(p), 0) : 1);
+    }
+    return memo.get(login);
+  };
+  return count;
+}
+
+// Every shortest path from the side's root to `login`, root first, one at a time.
+function* pathsTo(side, login) {
+  const ps = side.parents.get(login);
+  if (!ps.length) {
+    yield [login];
+    return;
+  }
+  for (const p of [...ps].sort()) {
+    for (const path of pathsTo(side, p)) yield [...path, login];
+  }
+}
+
+function* chainsThrough(sideS, sideT, meetLogin) {
+  for (const left of pathsTo(sideS, meetLogin)) {
+    for (const right of pathsTo(sideT, meetLogin)) yield [...left, ...right.reverse().slice(1)];
+  }
+}
+
+// Up to `cap` chains, taken in turn from each meeting person so a sample of a
+// huge set doesn't all run through the first one.
+// ponytail: a 500-chain sample; the route counts don't depend on it (they use the parent links).
+function sampleChains(sideS, sideT, meetLogins, cap) {
+  const gens = meetLogins.map((m) => chainsThrough(sideS, sideT, m));
+  const out = [];
+  while (gens.length && out.length < cap) {
+    for (let i = 0; i < gens.length && out.length < cap;) {
+      const next = gens[i].next();
+      if (next.done) gens.splice(i, 1);
+      else {
+        out.push(next.value);
+        i += 1;
+      }
+    }
+  }
+  return out;
+}
+
+// The links of every shortest path from a side's root to the meeting people,
+// as [from, to] pairs pointing from source to target.
+function pathLinks(side, meetLogins, towardRoot) {
+  const links = [];
+  const seen = new Set();
+  const stack = [...meetLogins];
+  while (stack.length) {
+    const login = stack.pop();
+    if (seen.has(login)) continue;
+    seen.add(login);
+    for (const p of side.parents.get(login)) {
+      links.push(towardRoot ? [login, p] : [p, login]);
+      stack.push(p);
+    }
+  }
+  return links;
 }
 
 function relation(a, b, edges) {
@@ -44,6 +121,7 @@ function sideSnapshot(side) {
   return [...side.nodes.entries()].map(([login, info]) => ({
     login,
     parent: side.parent.get(login) ?? null,
+    parents: side.parents.get(login),
     depth: info.depth,
     avatar_url: info.avatar_url,
     html_url: info.html_url,
@@ -110,6 +188,11 @@ async function search(source, target, opts, emit) {
     // One shared token serves every visitor, so a single search may spend at
     // most this many real GitHub requests (cache hits are free).
     maxRequests = 400,
+    // With fewer than 3 independent shortest routes, search one degree
+    // further for alternatives, spending at most this share of the requests
+    // used so far (and never more than maxRequests in total).
+    altRoutes = true,
+    extraBudget = 0.25,
     signal,
     onProgress = () => {},
   } = opts;
@@ -183,22 +266,17 @@ async function search(source, target, opts, emit) {
     return ['following', 'followers'];
   }
 
-  let meet = null;
   let reason = null;
   let stopInfo = {};
   let round = 0;
 
-  while (true) {
-    if (sideS.depth + sideT.depth >= maxDegrees) { reason = 'max_degrees'; break; }
-    if (!sideS.frontier.length || !sideT.frontier.length) { reason = 'dead_end'; break; }
-    if (signal?.aborted) { reason = 'aborted'; break; }
-
-    const expandSource = sideS.frontier.length <= sideT.frontier.length;
+  // Expands one side by a degree. Returns why it stopped early, or null.
+  async function expandRound(expandSource, ceiling, extra = false) {
     const side = expandSource ? sideS : sideT;
     const other = expandSource ? sideT : sideS;
     const sideName = expandSource ? 'source' : 'target';
     // The cost is the number of people this side still has to check, the
-    // same number the choice above compares.
+    // same number the choice of side compares.
     emit('round', {
       round: ++round,
       side: sideName,
@@ -206,6 +284,7 @@ async function search(source, target, opts, emit) {
       frontierSize: side.frontier.length,
       estimatedCost: side.frontier.length,
       otherSideCost: other.frontier.length,
+      ...(extra ? { extra: true } : {}),
     });
     side.depth += 1;
 
@@ -221,7 +300,7 @@ async function search(source, target, opts, emit) {
         let page = 1;
         while (page <= maxPages) {
           if (signal?.aborted) { roundStop = { reason: 'aborted' }; return false; }
-          if (requests >= maxRequests) { roundStop = { reason: 'budget' }; return false; }
+          if (requests >= ceiling) { roundStop = { reason: 'budget' }; return false; }
           let res;
           try {
             res = await get(`/api/${kind}/${login}?page=${page}`);
@@ -258,6 +337,7 @@ async function search(source, target, opts, emit) {
             if (!side.nodes.has(neighbor)) {
               side.nodes.set(neighbor, { avatar_url: u.avatar_url, html_url: u.html_url, depth: side.depth });
               side.parent.set(neighbor, login);
+              side.parents.set(neighbor, [login]);
               emit('discover', {
                 side: sideName,
                 login: neighbor,
@@ -266,6 +346,9 @@ async function search(source, target, opts, emit) {
                 avatarUrl: u.avatar_url,
                 edge: kind === 'following' ? { from: login, to: neighbor } : { from: neighbor, to: login },
               });
+            } else if (side.nodes.get(neighbor).depth === side.depth) {
+              const ps = side.parents.get(neighbor);
+              if (!ps.includes(login)) ps.push(login);
             }
           }
           if (items.length < 100) break;
@@ -276,24 +359,45 @@ async function search(source, target, opts, emit) {
       return true;
     });
 
-    if (roundStop) { ({ reason, ...stopInfo } = roundStop); break; }
-
     side.frontier = [...nextDiscovered.keys()].filter((login) => side.nodes.get(login).depth === side.depth);
     side.discoveredBy = nextDiscovered;
-
-    for (const login of side.frontier) {
-      if (other.nodes.has(login)) {
-        const combined = side.depth + other.nodes.get(login).depth;
-        if (!meet || combined < meet.combined) meet = { login, combined };
-      }
-    }
-    if (meet) break;
+    return roundStop;
   }
 
-  const explored = { source: sideSnapshot(sideS), target: sideSnapshot(sideT) };
-  const baseStats = { explored: sideS.nodes.size + sideT.nodes.size, requests, cacheHits, ms: Date.now() - startedAt };
+  // People in the newest ring of `side` that the other side has also
+  // reached, grouped by the length of the chain through them.
+  function meetings(side, other) {
+    const byLength = new Map();
+    for (const login of side.frontier) {
+      if (!other.nodes.has(login)) continue;
+      const combined = side.depth + other.nodes.get(login).depth;
+      if (!byLength.has(combined)) byLength.set(combined, []);
+      byLength.get(combined).push(login);
+    }
+    return byLength;
+  }
 
-  if (!meet) {
+  let meetLogins = null; // every person where a shortest chain crosses from one side to the other
+  let shortest = 0;
+
+  while (true) {
+    if (sideS.depth + sideT.depth >= maxDegrees) { reason = 'max_degrees'; break; }
+    if (!sideS.frontier.length || !sideT.frontier.length) { reason = 'dead_end'; break; }
+    if (signal?.aborted) { reason = 'aborted'; break; }
+
+    const expandSource = sideS.frontier.length <= sideT.frontier.length;
+    const roundStop = await expandRound(expandSource, maxRequests);
+    if (roundStop) { ({ reason, ...stopInfo } = roundStop); break; }
+
+    const found = expandSource ? meetings(sideS, sideT) : meetings(sideT, sideS);
+    if (found.size) {
+      shortest = Math.min(...found.keys());
+      meetLogins = found.get(shortest).sort();
+      break;
+    }
+  }
+
+  if (!meetLogins) {
     return {
       status: 'not_found',
       reason,
@@ -303,24 +407,86 @@ async function search(source, target, opts, emit) {
       limits: { maxDegrees, maxPages },
       source: srcUser.login,
       target: tgtUser.login,
-      explored,
-      stats: baseStats,
+      explored: { source: sideSnapshot(sideS), target: sideSnapshot(sideT) },
+      stats: { explored: sideS.nodes.size + sideT.nodes.size, requests, cacheHits, ms: Date.now() - startedAt },
     };
   }
 
-  const left = [];
-  for (let cur = meet.login; cur != null; cur = sideS.parent.get(cur)) left.unshift(cur);
-  const right = [];
-  for (let cur = sideT.parent.get(meet.login); cur != null; cur = sideT.parent.get(cur)) right.push(cur);
-  const path = [...left, ...right];
+  const s = srcUser.login;
+  const t = tgtUser.login;
+  const directed = mode === 'chain';
+  const firstMeet = meetLogins[0];
+  emit('meet', { login: firstMeet, sourceDepth: sideS.nodes.get(firstMeet).depth, targetDepth: sideT.nodes.get(firstMeet).depth });
 
-  const hops = [];
-  for (let i = 0; i < path.length - 1; i++) {
-    hops.push({ from: path[i], to: path[i + 1], direction: relation(path[i], path[i + 1], edges) });
+  // Every shortest chain crosses the meeting ring exactly once, so the total
+  // is (paths from source to m) x (paths from m to target), summed over it.
+  const countS = pathCounter(sideS);
+  const countT = pathCounter(sideT);
+  const totalShortestChains = meetLogins.reduce((n, m) => n + countS(m) * countT(m), 0);
+
+  const linksThrough = (meets) => [...pathLinks(sideS, meets, false), ...pathLinks(sideT, meets, true)];
+  let routeLinks = linksThrough(meetLogins);
+  let candidates = sampleChains(sideS, sideT, meetLogins, CHAIN_SAMPLE);
+
+  // Fewer than 3 independent shortest routes: look one degree further, on a
+  // small extra budget. Whatever stops it, the chains already found stand.
+  const frontiers = [sideS.frontier.length, sideT.frontier.length];
+  if (
+    altRoutes && shortest + 1 <= maxDegrees && !signal?.aborted && (frontiers[0] || frontiers[1])
+    && maxDisjointRoutes(toGraph(routeLinks, directed), s, t).count < SHOWN_CHAINS
+  ) {
+    const expandSource = frontiers[1] === 0 || (frontiers[0] > 0 && frontiers[0] <= frontiers[1]);
+    const ceiling = Math.min(maxRequests, requests + Math.ceil(requests * extraBudget));
+    try {
+      await expandRound(expandSource, ceiling, true);
+    } catch {
+      // keep the shortest chains
+    }
+    const found = expandSource ? meetings(sideS, sideT) : meetings(sideT, sideS);
+    const alt = (found.get(shortest + 1) ?? []).sort();
+    routeLinks = [...routeLinks, ...linksThrough(alt)];
+    candidates = [...candidates, ...sampleChains(sideS, sideT, alt, CHAIN_SAMPLE)];
   }
-  emit('meet', { login: meet.login, sourceDepth: sideS.nodes.get(meet.login).depth, targetDepth: sideT.nodes.get(meet.login).depth });
-  emit('path', { logins: path, edges: hops });
 
+  const hopsOf = (logins) => logins.slice(0, -1).map((from, i) => ({ from, to: logins[i + 1], direction: relation(from, logins[i + 1], edges) }));
+  const asCandidate = (logins) => ({ logins, mutualHops: hopsOf(logins).filter((h) => h.direction === 'mutual').length });
+
+  // Routes and gatekeepers are counted over the chains found, so the summary
+  // always agrees with the chains shown.
+  const graph = toGraph(routeLinks, directed);
+  const routes = maxDisjointRoutes(graph, s, t);
+  const gatekeepers = findGatekeepers(graph, s, t);
+  const pool = candidates.map(asCandidate);
+  let chosen = selectDiverseChains(pool, SHOWN_CHAINS);
+  // The second pick can block two others that would both have been free.
+  // Max-flow around the first chain finds the most routes that avoid it, so
+  // when that beats the greedy picks, keep the first chain and use those.
+  const first = chosen[0];
+  const around = maxDisjointRoutes(graph, s, t, first.logins.slice(1, -1));
+  if (disjointCount(chosen) < Math.min(SHOWN_CHAINS, 1 + around.count)) {
+    chosen = selectDiverseChains(pool, SHOWN_CHAINS, [first, ...around.paths.slice(0, SHOWN_CHAINS - 1).map(asCandidate)]);
+  }
+
+  const chains = chosen.map((c) => ({
+    logins: c.logins,
+    hops: hopsOf(c.logins),
+    degrees: c.logins.length - 1,
+    alternative: c.logins.length - 1 > shortest,
+    shared: c.shared,
+  }));
+  const { logins: path, hops } = chains[0];
+
+  // How far along each chain the source's search drew it; the rest was the
+  // target's. The animation draws each half on its own side.
+  const meetIndex = (logins) => {
+    let m = 0;
+    while (m + 1 < logins.length && sideS.nodes.get(logins[m + 1])?.depth === m + 1) m += 1;
+    return m;
+  };
+  emit('path', { logins: path, edges: hops, meetIndex: meetIndex(path) });
+  emit('chains', { chains: chains.map((c) => ({ logins: c.logins, meetIndex: meetIndex(c.logins) })), gatekeepers });
+
+  const explored = { source: sideSnapshot(sideS), target: sideSnapshot(sideT) };
   const nodesInfo = new Map();
   for (const n of [...explored.source, ...explored.target]) {
     nodesInfo.set(n.login, { avatar_url: n.avatar_url, html_url: n.html_url });
@@ -328,13 +494,17 @@ async function search(source, target, opts, emit) {
 
   return {
     status: 'found',
-    source: srcUser.login,
-    target: tgtUser.login,
+    source: s,
+    target: t,
     degrees: path.length - 1,
     path,
     hops,
+    chains,
+    totalShortestChains,
+    disjointRouteCount: routes.count,
+    gatekeepers,
     nodesInfo,
     explored,
-    stats: baseStats,
+    stats: { explored: sideS.nodes.size + sideT.nodes.size, requests, cacheHits, ms: Date.now() - startedAt },
   };
 }

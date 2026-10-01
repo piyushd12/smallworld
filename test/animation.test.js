@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createLayout, JITTER } from '../public/animation/layout.js';
 import { createPlayer, CATCH_UP_SECONDS } from '../public/animation/timeline.js';
-import { buildDemoGraph, distances, demoGraph, DEMO_PAIR, DEMO_SEED, createDemoFetch } from '../public/animation/demo-graph.js';
+import { buildDemoGraph, distances, demoGraph, DEMO_PAIR, DEMO_PAIRS, DEMO_SEED, createDemoFetch } from '../public/animation/demo-graph.js';
 import { findConnection } from '../public/search.js';
 
 // ---- Layout ----
@@ -202,9 +202,9 @@ test('demo graph: the same seed builds the same network', () => {
 });
 
 test('demo graph: about 2,000 people, all connected, with a few hubs', () => {
-  assert.equal(demoGraph.logins.length, 2000);
-  assert.equal(new Set(demoGraph.logins).size, 2000);
-  assert.equal(distances(demoGraph, demoGraph.logins[0]).size, 2000);
+  assert.equal(demoGraph.logins.length, 2005); // 2,000 plus the gatekeeper island
+  assert.equal(new Set(demoGraph.logins).size, 2005);
+  assert.equal(distances(demoGraph, demoGraph.logins[0]).size, 2005);
   const degree = (l) => demoGraph.following.get(l).length + demoGraph.followers.get(l).length;
   const typical = degree(DEMO_PAIR.source);
   for (const hub of demoGraph.hubs) assert.ok(degree(hub) > typical * 4, `${hub} is a hub`);
@@ -214,4 +214,26 @@ test('demo graph: the demo pair is at least 4 degrees apart', () => {
   const d = distances(demoGraph, DEMO_PAIR.source).get(DEMO_PAIR.target);
   assert.equal(d, DEMO_PAIR.degrees);
   assert.ok(d >= 4 && d <= 5);
+});
+
+const demoRun = (pair) => findConnection(pair.source, pair.target, {
+  fetchJson: createDemoFetch({ delayMs: 0 }), mode: 'either', maxDegrees: 6, maxPages: 3,
+});
+
+test('demo graph: the Gatekeeper pair runs through one person', async () => {
+  const result = await demoRun(DEMO_PAIRS.gatekeeper);
+  assert.equal(result.status, 'found');
+  assert.deepEqual(result.gatekeepers, ['nora-quill']);
+  assert.equal(result.disjointRouteCount, 1);
+  assert.ok(result.chains.length > 1 && result.chains.every((c) => c.logins.includes('nora-quill')));
+});
+
+test('demo graph: the Three routes pair has 3 chains that share no one', async () => {
+  const result = await demoRun(DEMO_PAIRS.routes);
+  assert.ok(result.disjointRouteCount >= 3);
+  assert.deepEqual(result.gatekeepers, []);
+  assert.equal(result.chains.length, 3);
+  const middles = result.chains.flatMap((c) => c.logins.slice(1, -1));
+  assert.equal(new Set(middles).size, middles.length);
+  assert.ok(result.chains.every((c) => !c.alternative));
 });

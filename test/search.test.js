@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { findConnection, SearchError } from '../public/search.js';
-import { createDemoFetch, DEMO_PAIR } from '../public/animation/demo-graph.js';
+import { createDemoFetch, DEMO_PAIR, mulberry32 } from '../public/animation/demo-graph.js';
 
 // Builds a fake `fetchJson` over a small following-graph. `following` maps a
 // login to the list of logins it follows; followers are derived by reversal.
@@ -338,4 +338,161 @@ test('events: a thrown error still emits end before rethrowing', async () => {
   const fetchJson = async () => ({ status: 401, data: {}, remaining: null, reset: null });
   await assert.rejects(() => findConnection('alice', 'dave', { fetchJson, onEvent: (e) => seen.push(e) }));
   assert.deepEqual([seen[0].type, seen.at(-1).type, seen.at(-1).reason], ['start', 'end', 'error']);
+});
+
+// ---- Multiple chains ----
+
+test('records every parent at the same depth, not just the first', async () => {
+  // s reaches m through both a and b; t has extra dead ends so the source side expands twice.
+  const { fetchJson } = buildFakeFetch({
+    s: ['a', 'b'], a: ['m'], b: ['m'], m: ['t'], t: ['z1', 'z2', 'z3', 'z4', 'z5'],
+  });
+  const result = await findConnection('s', 't', { fetchJson, maxPages: 1 });
+  const m = result.explored.source.find((n) => n.login === 'm');
+  assert.deepEqual([...m.parents].sort(), ['a', 'b']);
+  assert.equal(m.parent, m.parents[0]);
+  assert.equal(result.totalShortestChains, 2);
+  assert.deepEqual(result.chains.map((c) => c.logins.join('-')).sort(), ['s-a-m-t', 's-b-m-t']);
+});
+
+// Every simple path of exactly `len` links, by brute force.
+function countPathsBrute(following, s, t, len, directed) {
+  const adj = new Map();
+  const add = (a, b) => {
+    if (!adj.has(a)) adj.set(a, new Set());
+    adj.get(a).add(b);
+  };
+  for (const [a, list] of Object.entries(following)) {
+    for (const b of list) {
+      add(a, b);
+      if (!directed) add(b, a);
+    }
+  }
+  let n = 0;
+  const walk = (cur, seen, depth) => {
+    if (depth === len) {
+      if (cur === t) n += 1;
+      return;
+    }
+    for (const next of adj.get(cur) ?? []) if (!seen.has(next)) walk(next, new Set([...seen, next]), depth + 1);
+  };
+  walk(s, new Set([s]), 0);
+  return n;
+}
+
+function randomGraph(seed, n, links) {
+  const rand = mulberry32(seed);
+  const following = {};
+  for (let i = 0; i < n; i++) following[`u${i}`] = [];
+  for (let k = 0; k < links; k++) {
+    const a = Math.floor(rand() * n);
+    const b = Math.floor(rand() * n);
+    if (a !== b && !following[`u${a}`].includes(`u${b}`)) following[`u${a}`].push(`u${b}`);
+  }
+  return following;
+}
+
+test('totalShortestChains matches brute force, with no double counting through shared people', async () => {
+  const layered = { s: ['a1', 'a2', 'a3'] };
+  for (const a of ['a1', 'a2', 'a3']) layered[a] = ['b1', 'b2', 'b3'];
+  for (const b of ['b1', 'b2', 'b3']) layered[b] = ['c1', 'c2', 'c3'];
+  for (const c of ['c1', 'c2', 'c3']) layered[c] = ['t'];
+  const cases = [
+    { name: 'diamonds in a row', g: { s: ['a1', 'a2'], a1: ['m'], a2: ['m'], m: ['b1', 'b2'], b1: ['t'], b2: ['t'] } },
+    { name: '3x3x3 layers', g: layered },
+    { name: 'shared middle', g: { s: ['a', 'b', 'c'], a: ['m', 'n'], b: ['m'], c: ['n'], m: ['t'], n: ['t', 'm'] } },
+  ];
+  for (let seed = 1; seed <= 6; seed++) cases.push({ name: `random ${seed}`, g: randomGraph(seed, 40, 90) });
+
+  let checked = 0;
+  for (const { name, g } of cases) {
+    for (const mode of ['either', 'chain']) {
+      const directed = mode === 'chain';
+      const pairs = name.startsWith('random') ? [['u0', 'u1'], ['u2', 'u3'], ['u4', 'u5']] : [['s', 't']];
+      for (const [s, t] of pairs) {
+        const { fetchJson } = buildFakeFetch(g);
+        const result = await findConnection(s, t, { fetchJson, mode, maxPages: 1, maxDegrees: 8 });
+        if (result.status !== 'found') continue;
+        const brute = countPathsBrute(g, s, t, result.degrees, directed);
+        assert.equal(result.totalShortestChains, brute, `${name} ${mode} ${s}->${t}`);
+        assert.equal(countPathsBrute(g, s, t, result.degrees - 1, directed), 0, 'and it really is shortest');
+        checked += 1;
+      }
+    }
+  }
+  assert.ok(checked >= 15, `compared ${checked} searches`);
+});
+
+test('chains: the first is the result path, and each hop has a direction', async () => {
+  const { fetchJson } = buildFakeFetch({ s: ['a', 'b', 'c'], a: ['t'], b: ['t'], c: ['t'], t: ['b'] });
+  const result = await findConnection('s', 't', { fetchJson, maxPages: 1 });
+  assert.deepEqual(result.chains[0].logins, result.path);
+  assert.deepEqual(result.chains[0].hops, result.hops);
+  // b <-> t is mutual, so that chain goes first.
+  assert.deepEqual(result.path, ['s', 'b', 't']);
+  assert.equal(result.chains.length, 3);
+  assert.equal(result.disjointRouteCount, 3);
+  assert.deepEqual(result.gatekeepers, []);
+});
+
+test('gatekeeper: one person every chain runs through', async () => {
+  const { fetchJson } = buildFakeFetch({ s: ['a', 'b'], a: ['g'], b: ['g'], g: ['c', 'd'], c: ['t'], d: ['t'] });
+  const result = await findConnection('s', 't', { fetchJson, maxPages: 1 });
+  assert.deepEqual(result.gatekeepers, ['g']);
+  assert.equal(result.disjointRouteCount, 1);
+  assert.equal(result.totalShortestChains, 4);
+  assert.ok(result.chains.slice(1).every((c) => c.shared.get('g') === 0));
+});
+
+// s-a-b-t is the only shortest chain; s-c-d-e-t shares no one with it.
+const altGraph = { s: ['a', 'c'], a: ['b'], b: ['t'], c: ['d'], d: ['e'], e: ['t'] };
+
+test('extra search finds a one-degree-longer alternative when only one shortest chain exists', async () => {
+  const { fetchJson } = buildFakeFetch(altGraph);
+  const events = [];
+  const result = await findConnection('s', 't', { fetchJson, maxPages: 1, onEvent: (e) => events.push(e) });
+  assert.equal(result.degrees, 3);
+  assert.equal(result.totalShortestChains, 1);
+  assert.deepEqual(result.chains.map((c) => [c.logins.join('-'), c.alternative]), [['s-a-b-t', false], ['s-c-d-e-t', true]]);
+  assert.equal(result.disjointRouteCount, 2);
+  assert.ok(events.some((e) => e.type === 'round' && e.extra));
+  const types = events.map((e) => e.type);
+  assert.ok(types.indexOf('meet') < types.indexOf('path') && types.indexOf('path') < types.indexOf('chains'));
+
+  const off = await findConnection('s', 't', { fetchJson: buildFakeFetch(altGraph).fetchJson, maxPages: 1, altRoutes: false });
+  assert.equal(off.chains.length, 1);
+});
+
+test('extra search stays within its budget, maxRequests and max degrees', async () => {
+  const run = async (opts) => {
+    const fake = buildFakeFetch(altGraph);
+    let atMeet = null;
+    const events = [];
+    const result = await findConnection('s', 't', {
+      fetchJson: fake.fetchJson,
+      maxPages: 1,
+      concurrency: 1,
+      onEvent: (e) => {
+        events.push(e);
+        if (e.type === 'meet') atMeet = fake.calls.length;
+      },
+      ...opts,
+    });
+    return { result, events, atMeet, total: fake.calls.length };
+  };
+
+  const free = await run({});
+  assert.ok(free.total > free.atMeet, 'the extra round ran');
+  assert.ok(free.total <= free.atMeet + Math.ceil(free.atMeet * 0.25), `${free.total} requests after ${free.atMeet}`);
+
+  const none = await run({ extraBudget: 0 });
+  assert.equal(none.total, none.atMeet, 'no extra budget, no extra requests');
+  assert.equal(none.result.status, 'found');
+
+  const capped = await run({ maxRequests: free.atMeet + 1 });
+  assert.ok(capped.total <= free.atMeet + 1);
+
+  const atMax = await run({ maxDegrees: 3 });
+  assert.equal(atMax.result.degrees, 3);
+  assert.ok(!atMax.events.some((e) => e.extra), 'no search beyond max degrees');
 });

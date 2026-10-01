@@ -15,6 +15,9 @@
   --wave-source: #2563eb;
   --wave-target: #ea580c;
   --path: #c026d3;
+  --chain-1: var(--accent);
+  --chain-2: #0891b2;
+  --chain-3: #65a30d;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -35,6 +38,8 @@
     --wave-source: #5b8cff;
     --wave-target: #fb923c;
     --path: #e879f9;
+    --chain-2: #22d3ee;
+    --chain-3: #a3e635;
   }
 }
 
@@ -167,7 +172,16 @@ summary {
   color: var(--text);
 }
 
-#demo-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+#demo-btn:disabled, #demo-pick:disabled { opacity: 0.6; cursor: not-allowed; }
+
+#demo-pick {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 10px 8px;
+  font-size: 0.95rem;
+}
 
 label.animate-toggle {
   flex: none;
@@ -247,6 +261,50 @@ button {
   .chain .arrow { transform: rotate(90deg); margin: 4px 0 4px 16px; }
 }
 
+.routes-summary { margin: 4px 0 0; font-weight: 600; }
+.routes-note { margin: 2px 0 0; color: var(--muted); font-size: 0.8rem; }
+
+.chain-row.c1 { --chain: var(--chain-1); }
+.chain-row.c2 { --chain: var(--chain-2); }
+.chain-row.c3 { --chain: var(--chain-3); }
+
+/* With several chains, each row is a selectable block with its colour on the left. */
+.chain-pick + .chain { padding-top: 8px; }
+.chain-pick ~ .chain .card { border-color: color-mix(in srgb, var(--chain) 45%, var(--border)); }
+.chain-row:has(.chain-pick) {
+  border-left: 4px solid var(--chain);
+  padding: 8px 0 0 12px;
+  margin-top: 12px;
+  opacity: 0.75;
+}
+.chain-row.selected { opacity: 1; }
+
+label.chain-pick {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chain-swatch { width: 16px; height: 4px; border-radius: 3px; background: var(--chain); }
+
+.chain .card .badge {
+  font-size: 0.7rem;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.chain .card .badge-gatekeeper {
+  border-color: var(--chain-1);
+  color: var(--chain-1);
+  font-weight: 600;
+}
+
 .graph-wrap {
   position: relative;
   overflow: hidden;
@@ -296,6 +354,14 @@ button {
 .explore-line { stroke: var(--line); stroke-width: 1; }
 .path-line { stroke: var(--accent); stroke-width: 3; }
 .arrowhead { fill: var(--accent); }
+.path-line.c1, .avatar-ring.c1 { stroke: var(--chain-1); }
+.path-line.c2, .avatar-ring.c2 { stroke: var(--chain-2); }
+.path-line.c3, .avatar-ring.c3 { stroke: var(--chain-3); }
+.arrowhead.c1 { fill: var(--chain-1); }
+.arrowhead.c2 { fill: var(--chain-2); }
+.arrowhead.c3 { fill: var(--chain-3); }
+.path-line.dim { opacity: 0.35; stroke-width: 2; }
+.chain-node.dim { opacity: 0.55; }
 .dot-ring { fill: var(--surface); stroke: var(--dot); stroke-width: 1.5; }
 .dot-group { opacity: 0.7; }
 .dot-link:hover .dot-group { opacity: 1; }

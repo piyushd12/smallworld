@@ -68,6 +68,15 @@ test('a share URL built from a result parses back to the same values', () => {
   assert.deepEqual(parseShareQuery(params(buildShareQuery(plain))), plain);
 });
 
+test('the gatekeeper (gk) round-trips, and is dropped unless it is in the chain', () => {
+  const withGk = { from: 'alice', to: 'torvalds', via: ['bob', 'carol'], mode: 'either', gk: 'carol' };
+  assert.equal(buildShareQuery(withGk), '?from=alice&to=torvalds&via=bob,carol&gk=carol');
+  assert.deepEqual(parseShareQuery(params(buildShareQuery(withGk))), withGk);
+  assert.equal(parseShareQuery(params('from=alice&to=torvalds&via=bob&gk=mallory')).gk, undefined);
+  assert.equal(parseShareQuery(params('from=alice&to=torvalds&gk=bob')).gk, undefined);
+  assert.equal(buildShareQuery({ ...withGk, gk: 'mallory' }), '?from=alice&to=torvalds&via=bob,carol');
+});
+
 test('metaTags covers the chain, question and default cases', () => {
   const q = { from: 'alice', to: 'torvalds', via: ['bob', 'carol'], mode: 'either' };
   const verified = { valid: true, edges: [], users: ['alice', 'bob', 'carol', 'torvalds'].map((login) => ({ login })) };
@@ -175,6 +184,17 @@ test('og.png renders the chain, question and default cards at 1200x630', async (
     assertPng(await getPng(base, '?from=alice&to=torvalds'));
     assertPng(await getPng(base, ''));
     assertPng(await getPng(base, '?from=-bad&to=x')); // invalid input falls back to the default card
+  });
+});
+
+test('og.png adds the gatekeeper line to a chain card', async () => {
+  setFollows('alice>bob', 'bob>carol', 'carol>torvalds');
+  avatarsFail = false;
+  await withServer(async (base) => {
+    const plain = await getPng(base, '?from=alice&to=torvalds&via=bob,carol');
+    const gk = await getPng(base, '?from=alice&to=torvalds&via=bob,carol&gk=bob');
+    assertPng(gk);
+    assert.ok(!plain.equals(gk));
   });
 });
 

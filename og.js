@@ -104,7 +104,7 @@ function frame(children, publicUrl) {
 
 const fontSizeFor = (text) => (text.length > 34 ? 40 : text.length > 24 ? 52 : 64);
 
-function chainCard(verified, avatars, publicUrl) {
+function chainCard(verified, avatars, publicUrl, gatekeeper) {
   const { users, edges } = verified;
   const n = users.length;
   const degrees = n - 1;
@@ -127,7 +127,10 @@ function chainCard(verified, avatars, publicUrl) {
   return frame([
     headline([`@${first}`, arrowSvg('forward', 52), `@${last}`], fontSizeFor(`@${first}@${last}`)),
     h('div', { display: 'flex', marginTop: 14, fontSize: 34, color: MUTED }, `${degrees} ${degrees === 1 ? 'degree' : 'degrees'} apart on GitHub`),
-    h('div', { display: 'flex', alignItems: 'center', marginTop: 56 }, row),
+    h('div', { display: 'flex', alignItems: 'center', marginTop: gatekeeper ? 40 : 56 }, row),
+    ...(gatekeeper
+      ? [h('div', { display: 'flex', marginTop: 36, fontSize: 30, color: ACCENT }, `Every route goes through @${gatekeeper}`)]
+      : []),
   ], publicUrl);
 }
 
@@ -170,7 +173,7 @@ export async function renderOg(q, verified, publicUrl) {
   if (!q) return renderDefault(publicUrl);
   if (verified?.valid && verified.users.length >= 2) {
     const avatars = await Promise.all(verified.users.map((u) => loadAvatar(u.login)));
-    return toPng(chainCard(verified, avatars, publicUrl));
+    return toPng(chainCard(verified, avatars, publicUrl, q.gk));
   }
   const avatars = await Promise.all([loadAvatar(q.from), loadAvatar(q.to)]);
   return toPng(questionCard(q, avatars, publicUrl));
