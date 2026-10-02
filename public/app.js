@@ -28,12 +28,30 @@ const nativeShareBtn = document.getElementById('native-share');
 const demoBtn = document.getElementById('demo-btn');
 const animateToggle = document.getElementById('animate');
 const replayBtn = document.getElementById('replay-btn');
+const collabOptions = document.getElementById('collab-options');
+const maxContributorsInput = document.getElementById('max-contributors');
+const minCommitsInput = document.getElementById('min-commits');
+const maxReposInput = document.getElementById('max-repos');
+const collabNote = document.getElementById('collab-note');
 const watch = mountWatch(document.getElementById('watch'));
 
 let controller = null;
 let lastRun = null; // { timeline, demo } of the result on screen, for "Replay search"
 let maxPagesTouched = false;
 maxPagesInput.addEventListener('input', () => { maxPagesTouched = true; });
+let maxDegreesTouched = false;
+maxDegreesInput.addEventListener('input', () => { maxDegreesTouched = true; });
+
+// Collaboration mode has its own options, and each degree costs more
+// requests, so it defaults to 4 degrees instead of 6.
+function applyLinkType() {
+  const collab = form.link.value === 'collab';
+  collabOptions.hidden = !collab;
+  for (const el of document.querySelectorAll('.follows-only')) el.hidden = collab;
+  if (!maxDegreesTouched) maxDegreesInput.value = collab ? 4 : 6;
+}
+for (const radio of form.link) radio.addEventListener('change', applyLinkType);
+applyLinkType(); // the browser may have restored the choice on reload
 
 // Discover whether the server has a token so we can warn the user and pick a
 // sane default for max pages (higher rate limit == can afford more pages).
@@ -84,11 +102,13 @@ function resetUI() {
   statusLine.textContent = 'Starting search…';
 }
 
-function updateStatus({ degree, checked, requests, cacheHits, remaining }) {
+function updateStatus({ degree, checked, requests, cacheHits, remaining, maxRequests, skipped }) {
   statusLine.hidden = false;
   const rate = remaining != null ? `, ${remaining} rate limit remaining` : '';
+  const budget = maxRequests != null ? `${requests}/${maxRequests}` : requests;
+  const skips = skipped ? ` Ignored ${plural(skipped.hubs, 'hub repo')}, ${plural(skipped.forks, 'fork')} and ${plural(skipped.bots, 'bot')}.` : '';
   statusLine.textContent =
-    `Searching degree ${degree}… ${checked} users checked, ${requests} GitHub requests (${cacheHits} more from cache)${rate}.`;
+    `Searching degree ${degree}… ${checked} users checked, ${budget} GitHub requests (${cacheHits} more from cache)${rate}.${skips}`;
 }
 
 const smoothScroll = (el) => el.scrollIntoView({
@@ -98,7 +118,7 @@ const smoothScroll = (el) => el.scrollIntoView({
 
 // Runs one search. With "Animate search" on, the result is shown once the
 // animation has played out, then the page scrolls down to it.
-async function runSearch({ source, target, mode, maxDegrees, maxPages, fetchJson, demo = false }) {
+async function runSearch({ source, target, mode, maxDegrees, maxPages, fetchJson, demo = false, link = 'follows', collabOpts = {} }) {
   const altRoutes = altRoutesInput.checked;
   const animate = animateToggle.checked;
   controller = new AbortController();
@@ -121,6 +141,8 @@ async function runSearch({ source, target, mode, maxDegrees, maxPages, fetchJson
       maxDegrees,
       maxPages,
       altRoutes,
+      link,
+      ...collabOpts,
       signal: controller.signal,
       onProgress: updateStatus,
       onEvent: animate ? watch.push : undefined,
@@ -158,6 +180,12 @@ form.addEventListener('submit', (e) => {
     maxDegrees: Number(maxDegreesInput.value) || 6,
     maxPages: Number(maxPagesInput.value) || 1,
     fetchJson: makeFetchJson(),
+    link: form.link.value,
+    collabOpts: {
+      maxContributors: Number(maxContributorsInput.value),
+      minCommits: Number(minCommitsInput.value),
+      maxRepos: Number(maxReposInput.value) || 30,
+    },
   });
 });
 
@@ -170,10 +198,11 @@ demoBtn.addEventListener('click', () => {
     source: pair.source,
     target: pair.target,
     mode: 'either',
-    maxDegrees: 6,
+    maxDegrees: pair.link === 'collab' ? 4 : 6,
     maxPages: 3,
     fetchJson: createDemoFetch(),
     demo: true,
+    link: pair.link ?? 'follows',
   });
 });
 
@@ -224,6 +253,7 @@ function handleResult(result, mode, demo) {
 }
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const stepWord = (result) => (result.link === 'collab' ? 'step' : 'degree');
 const TRY_EITHER = 'Switch the link mode to "Either person follows the other" in Settings to count follows in both directions.';
 
 // Why no chain was found, in terms the user can act on. The first three are
@@ -231,6 +261,16 @@ const TRY_EITHER = 'Switch the link mode to "Either person follows the other" in
 // limits of this search", never "no connection exists".
 function notFoundMessage(result) {
   const { maxDegrees, maxPages } = result.limits ?? {};
+  if (result.link === 'collab') {
+    // Collaboration searches never prove there's no link; the hint names the settings that bound it.
+    const why = {
+      max_degrees: `No chain within ${plural(maxDegrees, 'collaboration step')}.`,
+      dead_end: 'Checked everyone reachable through the repositories the search could use, without finding a chain.',
+      budget: `Stopped after ${result.stats.requests} GitHub requests, the per-search limit, without finding a chain.`,
+      rate_limit: 'Hit the GitHub rate limit before finding a chain.',
+    }[result.reason];
+    if (why) return `${why} ${result.hint}`;
+  }
   switch (result.reason) {
     case 'isolated':
       return `@${result.login} has no followers and follows no one, so they aren't connected to anyone on GitHub.`;
@@ -265,7 +305,11 @@ function notFoundMessage(result) {
 function renderFound(result, mode, demo = false) {
   resultSection.hidden = false;
   const between = result.degrees - 1;
-  headlineEl.textContent = `@${result.source} is ${result.degrees} degrees from @${result.target} (${between} people in between)`;
+  const collab = result.link === 'collab';
+  headlineEl.textContent = collab
+    ? `@${result.source} is ${plural(result.degrees, 'collaboration step')} from @${result.target}`
+    : `@${result.source} is ${result.degrees} degrees from @${result.target} (${between} people in between)`;
+  collabNote.hidden = !collab;
   renderRoutesSummary(result);
 
   // The selected chain is highlighted in the graph and is the one shared.
@@ -315,7 +359,7 @@ function renderRoutesSummary(result) {
   else first = `${plural(n, 'independent route')}.`;
   const total = result.totalShortestChains;
   const chains = `${total.toLocaleString('en-US')} shortest ${total === 1 ? 'chain' : 'chains'}`;
-  routesSummary.textContent = `${first} We found ${chains} of ${plural(result.degrees, 'degree')}.`;
+  routesSummary.textContent = `${first} We found ${chains} of ${plural(result.degrees, stepWord(result))}.`;
 }
 
 // Up to three chain rows. With more than one, each gets a radio to select it.
@@ -338,7 +382,7 @@ function renderChains(result, linkProfiles, selected, onSelect) {
       const swatch = document.createElement('i');
       swatch.className = 'chain-swatch';
       const text = document.createElement('span');
-      text.textContent = `Chain ${i + 1} · ${plural(chain.degrees, 'degree')}${chain.alternative ? ', alternative route' : ''}`;
+      text.textContent = `Chain ${i + 1} · ${plural(chain.degrees, stepWord(result))}${chain.alternative ? ', alternative route' : ''}`;
       label.append(input, swatch, text);
       row.appendChild(label);
     }
@@ -381,10 +425,25 @@ function renderChain(el, chain, result, linkProfiles) {
     el.appendChild(card);
 
     if (i < chain.logins.length - 1) {
-      const arrow = document.createElement('div');
-      arrow.className = 'arrow';
-      arrow.textContent = `→ ${directionLabel(chain.hops[i].direction)}`;
-      el.appendChild(arrow);
+      const hop = chain.hops[i];
+      if (hop.via) {
+        // The repo both people committed to, in place of a follow arrow.
+        const pill = document.createElement(linkProfiles ? 'a' : 'span');
+        pill.className = 'repo-pill';
+        pill.textContent = hop.via.repo;
+        pill.title = `${hop.from}: ${plural(hop.via.aCommits, 'commit')}, ${hop.to}: ${plural(hop.via.bCommits, 'commit')}`;
+        if (linkProfiles) {
+          pill.href = `https://github.com/${hop.via.repo}`;
+          pill.target = '_blank';
+          pill.rel = 'noopener';
+        }
+        el.appendChild(pill);
+      } else {
+        const arrow = document.createElement('div');
+        arrow.className = 'arrow';
+        arrow.textContent = `→ ${directionLabel(hop.direction)}`;
+        el.appendChild(arrow);
+      }
     }
   });
 }
@@ -479,6 +538,16 @@ function renderGraph(result, linkProfiles, selected = 0) {
       const a = pos.get(hop.from);
       const b = pos.get(hop.to);
       if (!a || !b) return;
+      if (hop.via) {
+        // A shared repo has no direction: a plain line, labelled with the repo.
+        const name = hop.via.repo.length > 18 ? `${hop.via.repo.slice(0, 17)}…` : hop.via.repo;
+        parts.push(
+          `<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" class="path-line c${k + 1}${dim}"></line>`,
+          `<text x="${(a.x + b.x) / 2}" y="${(a.y + b.y) / 2 - 7}" class="repo-label${dim}" text-anchor="middle">`
+            + `<title>${esc(hop.via.repo)}</title>${esc(name)}</text>`,
+        );
+        return;
+      }
       const reversed = hop.direction === 'followed_by';
       const [p1, p2] = reversed ? [b, a] : [a, b];
       const marker = `url(#arrow-${k + 1})`;
@@ -650,6 +719,8 @@ function renderStats(result, demo) {
       `${result.stats.cacheHits} answered from cache`,
       `${(result.stats.ms / 1000).toFixed(1)}s`,
     ];
+  const sk = result.stats.skipped;
+  if (sk) items.splice(1, 0, `${plural(sk.hubs, 'hub repo')} ignored`, `${plural(sk.forks, 'fork')} skipped`, `${plural(sk.bots, 'bot')} filtered`);
   for (const text of items) {
     const li = document.createElement('li');
     li.textContent = text;
@@ -665,13 +736,21 @@ const urlMode = (mode) => (mode === 'chain' ? 'follow' : 'either');
 // Shares the selected chain, and the gatekeeper if every route has one.
 function renderSharePanel(result, mode, selected = 0) {
   const chain = result.chains[selected];
+  const collab = result.link === 'collab';
   const query = buildShareQuery({
-    from: result.source, to: result.target, via: chain.logins.slice(1, -1), mode: urlMode(mode), gk: result.gatekeepers?.[0],
+    from: result.source,
+    to: result.target,
+    via: chain.logins.slice(1, -1),
+    mode: urlMode(mode),
+    gk: result.gatekeepers?.[0],
+    ...(collab ? { link: 'collab', repos: chain.hops.map((h) => h.via.repo) } : {}),
   });
   history.replaceState(null, '', query);
 
   const link = `${location.origin}/${query}`;
-  const text = `I'm ${chain.degrees} degrees away from @${result.target} on GitHub. Trace your own chain:`;
+  const text = collab
+    ? `I'm ${plural(chain.degrees, 'collaboration step')} away from @${result.target} on GitHub. Trace your own chain:`
+    : `I'm ${chain.degrees} degrees away from @${result.target} on GitHub. Trace your own chain:`;
   document.getElementById('share-x').href =
     `https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}&url=${encodeURIComponent(link)}`;
   document.getElementById('share-linkedin').href =
@@ -695,19 +774,17 @@ function renderSharePanel(result, mode, selected = 0) {
 
 // Turns a verify-path reply into the same shape a search produces, so the
 // normal renderers draw it.
-function renderShared(data, mode) {
+function renderShared(data, mode, link) {
   const path = data.users.map((u) => u.login);
-  const hops = data.edges.map((e) => ({
-    from: e.from,
-    to: e.to,
-    direction: e.aFollowsB && e.bFollowsA ? 'mutual' : e.aFollowsB ? 'follows' : 'followed_by',
-  }));
+  const hops = data.edges.map((e) => (e.repo
+    ? { from: e.from, to: e.to, direction: 'collab', via: { repo: e.repo, aCommits: e.aCommits, bCommits: e.bCommits } }
+    : { from: e.from, to: e.to, direction: e.aFollowsB && e.bFollowsA ? 'mutual' : e.aFollowsB ? 'follows' : 'followed_by' }));
   const nodesInfo = new Map(data.users.map((u) => [u.login, { avatar_url: u.avatarUrl, html_url: u.url }]));
   statusLine.hidden = true;
   renderFound({
     status: 'found', source: path[0], target: path.at(-1), degrees: hops.length, path, hops, nodesInfo,
     chains: [{ logins: path, hops, degrees: hops.length, alternative: false, shared: new Map() }],
-    explored: { source: [], target: [] }, stats: null,
+    explored: { source: [], target: [] }, stats: null, ...(link === 'collab' ? { link } : {}),
   }, mode);
   sharedNote.hidden = false;
 }
@@ -719,9 +796,10 @@ async function openSharedLink(shared, mode) {
   resetUI();
   statusLine.textContent = 'Checking shared result…';
   try {
-    const res = await fetch(`/api/verify-path?users=${[shared.from, ...shared.via, shared.to].join(',')}&mode=${shared.mode}`);
+    const collab = shared.link === 'collab' ? `&link=collab&repos=${shared.repos.join(',')}` : '';
+    const res = await fetch(`/api/verify-path?users=${[shared.from, ...shared.via, shared.to].join(',')}&mode=${shared.mode}${collab}`);
     const data = await res.json();
-    if (data.valid) return renderShared(data, mode);
+    if (data.valid) return renderShared(data, mode, shared.link);
   } catch {
     // fall through to a normal search
   }
@@ -734,6 +812,8 @@ if (shared) {
   sourceInput.value = shared.from;
   targetInput.value = shared.to;
   form.mode.value = mode;
+  form.link.value = shared.link ?? 'follows';
+  applyLinkType();
   if (shared.via) openSharedLink(shared, mode);
   else form.requestSubmit();
 }

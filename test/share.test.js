@@ -13,11 +13,18 @@ const ONE_PX_PNG = Buffer.from(
 );
 const realFetch = globalThis.fetch;
 let follows = new Set(); // "a>b"
+let contributors = {}; // "owner/repo" -> [{ login, type, contributions }]
 let avatarsFail = false;
 globalThis.fetch = async (url, opts = {}) => {
   const u = String(url);
   const rel = u.match(/^https:\/\/api\.github\.com\/users\/([^/]+)\/following\/([^/?]+)$/);
   if (rel) return new Response(null, { status: follows.has(`${rel[1]}>${rel[2]}`) ? 204 : 404 });
+  const contrib = u.match(/^https:\/\/api\.github\.com\/repos\/([^/]+\/[^/]+)\/contributors\?per_page=100&anon=0$/);
+  if (contrib) {
+    const list = contributors[contrib[1]];
+    if (!list) return new Response('{"message":"Not Found"}', { status: 404 });
+    return Response.json(list.map((c, i) => ({ id: i + 1, type: 'User', ...c })));
+  }
   if (u.startsWith('https://github.com/') && u.includes('.png')) {
     if (avatarsFail) throw new Error('avatar download failed');
     return new Response(ONE_PX_PNG, { status: 200, headers: { 'content-type': 'image/png' } });
@@ -209,4 +216,110 @@ test('og.png still returns a card (initials) when avatars fail to load', async (
   } finally {
     avatarsFail = false;
   }
+});
+
+// ---- Collaboration links ----
+
+function setContributors(map) {
+  contributors = map;
+  cache.clear();
+}
+
+test('a collaboration share URL round-trips, with one repo per link', () => {
+  const original = { from: 'alice', to: 'dave', via: ['bob', 'carol'], mode: 'either', link: 'collab', repos: ['pallets/flask', 'bob/tools', 'carol/site.io'] };
+  const qs = buildShareQuery(original);
+  assert.equal(qs, '?from=alice&to=dave&via=bob,carol&link=collab&repos=pallets/flask,bob/tools,carol/site.io');
+  assert.deepEqual(parseShareQuery(params(qs)), original);
+  assert.deepEqual(parseShareQuery(params('from=alice&to=dave&link=collab')), { from: 'alice', to: 'dave', via: null, mode: 'either', link: 'collab' });
+  // Old links have no link parameter and still mean follows.
+  assert.equal(parseShareQuery(params('from=alice&to=dave&via=bob')).link, undefined);
+});
+
+test('a collaboration share URL needs a valid repo for every link', () => {
+  const base = 'from=alice&to=dave&via=bob&link=collab';
+  assert.equal(parseShareQuery(params(base)), null); // no repos
+  assert.equal(parseShareQuery(params(`${base}&repos=a/one`)), null); // one short
+  assert.equal(parseShareQuery(params(`${base}&repos=a/one,b/two,c/three`)), null); // one too many
+  for (const bad of ['a/..', 'a', 'a/b/c', '-a/b', 'a/b c', 'a/<x>']) {
+    assert.equal(parseShareQuery(params(`${base}&repos=a/one,${encodeURIComponent(bad)}`)), null, bad);
+  }
+  assert.equal(parseShareQuery(params('from=alice&to=dave&link=friends')), null);
+});
+
+async function verifyCollab(base, users, repos) {
+  const res = await realFetch(`${base}/api/verify-path?users=${users}&link=collab&repos=${repos}`);
+  return { status: res.status, body: await res.json() };
+}
+
+test('verify-path in collaboration mode checks each pair against its repo', async () => {
+  setContributors({
+    'pallets/flask': [{ login: 'Alice', contributions: 14 }, { login: 'bob', contributions: 5 }],
+    'bob/tools': [{ login: 'bob', contributions: 30 }, { login: 'carol', contributions: 1 }],
+  });
+  await withServer(async (base) => {
+    const { body } = await verifyCollab(base, 'alice,bob,carol', 'pallets/flask,bob/tools');
+    assert.equal(body.valid, true);
+    assert.deepEqual(body.edges, [
+      { from: 'alice', to: 'bob', repo: 'pallets/flask', aCommits: 14, bCommits: 5 },
+      { from: 'bob', to: 'carol', repo: 'bob/tools', aCommits: 30, bCommits: 1 },
+    ]);
+  });
+});
+
+test('verify-path in collaboration mode rejects a broken link and a bot', async () => {
+  setContributors({
+    'pallets/flask': [{ login: 'alice', contributions: 14 }, { login: 'bob', contributions: 5 }],
+    'bob/tools': [{ login: 'bob', contributions: 30 }],
+    'carol/bots': [{ login: 'carol', contributions: 3 }, { login: 'bob', contributions: 9, type: 'Bot' }],
+  });
+  await withServer(async (base) => {
+    const broken = (await verifyCollab(base, 'alice,bob,carol', 'pallets/flask,bob/tools')).body;
+    assert.equal(broken.valid, false);
+    assert.deepEqual(broken.edges[1], { from: 'bob', to: 'carol', repo: 'bob/tools', aCommits: 30, bCommits: 0 });
+    const bot = (await verifyCollab(base, 'alice,bob,carol', 'pallets/flask,carol/bots')).body;
+    assert.equal(bot.valid, false);
+    assert.equal(bot.edges[1].aCommits, 0);
+    assert.equal((await verifyCollab(base, 'alice,bob,carol', 'pallets/flask,gone/repo')).body.valid, false);
+  });
+});
+
+test('verify-path in collaboration mode rejects missing or mismatched repos with 400', async () => {
+  await withServer(async (base) => {
+    assert.equal((await realFetch(`${base}/api/verify-path?users=alice,bob&link=collab`)).status, 400);
+    assert.equal((await verifyCollab(base, 'alice,bob,carol', 'a/one')).status, 400);
+    assert.equal((await verifyCollab(base, 'alice,bob', 'a/..')).status, 400);
+    assert.equal((await realFetch(`${base}/api/verify-path?users=alice,bob&link=friends`)).status, 400);
+  });
+});
+
+test('a collaboration link gets its own preview tags and card', async () => {
+  setContributors({
+    'pallets/flask': [{ login: 'alice', contributions: 14 }, { login: 'bob', contributions: 5 }],
+    'bob/tools': [{ login: 'bob', contributions: 30 }, { login: 'carol', contributions: 2 }],
+  });
+  avatarsFail = false;
+  await withServer(async (base) => {
+    const qs = '?from=alice&to=carol&via=bob&link=collab&repos=pallets/flask,bob/tools';
+    const html = await (await realFetch(`${base}/${qs}`)).text();
+    assert.match(html, /<title>@alice is 2 collaboration steps from @carol \| smallworld<\/title>/);
+    assert.match(html, /@alice and @bob on pallets\/flask/);
+    assert.match(html, /og\.png\?from=alice&amp;to=carol&amp;via=bob&amp;link=collab&amp;repos=pallets\/flask,bob\/tools/);
+    const card = await getPng(base, qs);
+    assertPng(card);
+    assert.ok(!card.equals(await getPng(base, '?from=alice&to=carol&via=bob')), 'repo names change the card');
+    assertPng(await getPng(base, '?from=alice&to=carol&link=collab'));
+  });
+});
+
+test('the contributors endpoint marks hubs, keeps bots marked and validates the repo', async () => {
+  setContributors({ 'pallets/flask': [{ login: 'alice', contributions: 14 }, { login: 'dependabot[bot]', contributions: 9, type: 'Bot' }] });
+  await withServer(async (base) => {
+    const body = await (await realFetch(`${base}/api/contributors/pallets/flask`)).json();
+    assert.deepEqual(body.items.map((c) => [c.login, c.type, c.contributions]), [['alice', 'User', 14], ['dependabot[bot]', 'Bot', 9]]);
+    assert.equal(body.more, false);
+    assert.equal((await realFetch(`${base}/api/contributors/pallets/..`)).status, 404); // normalised away by the router
+    assert.equal((await realFetch(`${base}/api/contributors/-bad/flask`)).status, 400);
+    assert.equal((await realFetch(`${base}/api/repos?users=a--b`)).status, 400);
+    assert.equal((await realFetch(`${base}/api/repos?users=${Array.from({ length: 16 }, (_, i) => `u${i}`).join(',')}`)).status, 400);
+  });
 });

@@ -47,6 +47,11 @@
       <summary>Settings</summary>
       <div class="settings-grid">
         <fieldset>
+          <legend>Link people by</legend>
+          <label class="radio"><input type="radio" name="link" value="follows" checked> Follows</label>
+          <label class="radio"><input type="radio" name="link" value="collab"> Collaboration (committed to the same repository)</label>
+        </fieldset>
+        <fieldset class="follows-only">
           <legend>Link mode</legend>
           <label class="radio"><input type="radio" name="mode" value="either" checked> Either person follows the other</label>
           <label class="radio"><input type="radio" name="mode" value="chain"> Follow chains only (A follows B follows C)</label>
@@ -54,11 +59,34 @@
         <label>Max degrees
           <input type="number" id="max-degrees" min="1" max="10" value="6">
         </label>
-        <label>Max pages per follower list
+        <label class="follows-only">Max pages per follower list
           <input type="number" id="max-pages" min="1" max="10" value="3">
         </label>
         <label class="radio"><input type="checkbox" id="alt-routes" checked> Extra search for alternative routes</label>
       </div>
+      <details id="collab-options" class="collab-options" hidden>
+        <summary>Collaboration options</summary>
+        <div class="settings-grid">
+          <label>Ignore repos with more than
+            <select id="max-contributors">
+              <option value="25">25 contributors</option>
+              <option value="50" selected>50 contributors</option>
+              <option value="100">100 contributors</option>
+            </select>
+          </label>
+          <label>Minimum commits per person
+            <select id="min-commits">
+              <option value="1">1</option>
+              <option value="2" selected>2</option>
+              <option value="3">3</option>
+              <option value="5">5</option>
+            </select>
+          </label>
+          <label>Max repos per person
+            <input type="number" id="max-repos" min="1" max="50" value="30">
+          </label>
+        </div>
+      </details>
     </details>
 
     <div class="actions">
@@ -69,6 +97,7 @@
         <option value="long">Long chain</option>
         <option value="gatekeeper">Gatekeeper</option>
         <option value="routes">Three routes</option>
+        <option value="collab">Collaboration</option>
       </select>
       <label class="animate-toggle"><input type="checkbox" id="animate" checked> Animate search</label>
     </div>
@@ -147,6 +176,7 @@
       <svg id="graph" role="img" aria-label="Explored connection graph"></svg>
       <p class="graph-hint">Drag to pan · Ctrl + scroll or pinch to zoom · double-click to fit</p>
     </div>
+    <p id="collab-note" class="routes-note" hidden>People are linked when both have committed to the same repository. Very large repositories are ignored.</p>
     <ul id="stats" class="stats"></ul>
     <div id="share" class="share">
       <button type="button" id="replay-btn" hidden>Replay search</button>

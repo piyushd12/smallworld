@@ -256,9 +256,26 @@ button {
   white-space: nowrap;
 }
 
+/* The repo two people both committed to, between their cards. */
+.chain .repo-pill {
+  font-size: 0.78rem;
+  padding: 2px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  color: var(--accent);
+  background: var(--bg);
+  text-decoration: none;
+  white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+a.repo-pill:hover { border-style: solid; border-color: var(--accent); }
+
 @media (max-width: 640px) {
   .chain { flex-direction: column; align-items: flex-start; }
   .chain .arrow { transform: rotate(90deg); margin: 4px 0 4px 16px; }
+  .chain .repo-pill { margin: 2px 0 2px 16px; max-width: 100%; }
 }
 
 .routes-summary { margin: 4px 0 0; font-weight: 600; }
@@ -367,6 +384,9 @@ label.chain-pick {
 .dot-link:hover .dot-group { opacity: 1; }
 .avatar-ring { fill: var(--surface); stroke: var(--accent); stroke-width: 2; }
 .avatar-label { fill: var(--muted); font-size: 10px; }
+.repo-label { fill: var(--accent); font-size: 10px; paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
+.repo-label.dim { opacity: 0.45; }
+.collab-options { margin-top: 14px; }
 
 .stats {
   display: flex;
@@ -437,6 +457,7 @@ footer {
 .share .button:hover { border-color: var(--accent); color: var(--accent); }
 
 .share [hidden], .shared-note[hidden], .stats[hidden] { display: none; }
+.follows-only[hidden], .collab-options[hidden], .routes-note[hidden] { display: none; }
 
 /* ---- Watch the search ---- */
 

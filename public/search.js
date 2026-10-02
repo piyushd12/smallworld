@@ -36,7 +36,150 @@ function initSide(rootLogin, rootInfo) {
     // explored graph holds every shortest path, not just the first one found.
     parents: new Map([[rootLogin, []]]),
     discoveredBy: new Map(),
+    commitsBy: new Map(),
+    // People expanded so far and the work they took (lists or repos), for the cost estimate.
+    expanded: 0,
+    units: 0,
   };
+}
+
+// ---- Expanders: how one batch of people turns into their neighbours ----
+// expand(batch, fetch, isSourceSide) resolves to { neighbours, units, stop }:
+// neighbours maps each person in the batch to [{ login, avatar_url, html_url,
+// edge | via, weight?, commits? }], units is the work done (follower lists or
+// repos), and stop is why the round must end early. `fetch(path, allow)`
+// returns { res } or { stop }; statuses in `allow` come back as answers.
+
+export function createFollowsExpander({ maxPages = 3, mode = 'either', concurrency = 4 } = {}) {
+  return {
+    batchSize: 1,
+    concurrency,
+    defaultCost: 1, // so the cost is exactly the frontier size
+    async expand([login], fetch, isSourceSide) {
+      const kinds = mode === 'chain' ? [isSourceSide ? 'following' : 'followers'] : ['following', 'followers'];
+      const found = [];
+      const done = (stop) => ({ neighbours: new Map([[login, found]]), units: 1, stop });
+      for (const kind of kinds) {
+        for (let page = 1; page <= maxPages; page++) {
+          const { res, stop } = await fetch(`/api/${kind}/${login}?page=${page}`);
+          if (stop) return done(stop);
+          const items = res.data.items ?? [];
+          for (const u of items) {
+            found.push({
+              login: u.login,
+              avatar_url: u.avatar_url,
+              html_url: u.html_url,
+              edge: kind === 'following' ? { from: login, to: u.login } : { from: u.login, to: login },
+            });
+          }
+          if (items.length < 100) break;
+        }
+      }
+      return done(null);
+    },
+  };
+}
+
+const isBot = (c) => c.type === 'Bot' || /\[bot\]$/i.test(c.login);
+// Answers that just mean "no contributor list": empty (204), gone (404), no commits yet (409), blocked (451).
+const NO_LIST = [204, 404, 409, 451];
+
+// Links two people who both committed to the same repo. Forks (their lists
+// include the upstream project) and repos over `maxStars` are dropped before
+// any request; repos with more than `maxContributors` are hubs and skipped too.
+export function createCollabExpander({
+  minCommits = 2, maxContributors = 50, maxRepos = 30, maxStars = 5000, concurrency = 6,
+} = {}) {
+  const skipped = { hubs: new Set(), forks: new Set(), bots: new Set() };
+  const contributorsOf = new Map(); // repo -> Map(lower login -> contributor), or null to skip
+
+  function readList(repo, res) {
+    const items = res.status === 200 ? res.data?.items ?? [] : [];
+    if (!items.length) return null;
+    if (res.data.more || items.length > maxContributors) {
+      skipped.hubs.add(repo);
+      return null;
+    }
+    const list = new Map();
+    for (const c of items) {
+      if (isBot(c)) skipped.bots.add(c.login);
+      else list.set(c.login.toLowerCase(), c);
+    }
+    return list;
+  }
+
+  return {
+    batchSize: 15, // one GraphQL query answers up to 15 people
+    concurrency: 1,
+    defaultCost: 20, // repos per person, until the search has seen some
+    skipped,
+    async expand(batch, fetch) {
+      const first = await fetch(`/api/repos?users=${batch.join(',')}`);
+      if (first.stop) return { neighbours: new Map(), units: 0, stop: first.stop };
+      const users = first.res.data.users ?? {};
+
+      // Small repos first: fewer contributors means closer collaboration.
+      const reposOf = new Map(batch.map((login) => {
+        const kept = (users[login] ?? []).filter((r) => {
+          if (r.isFork) skipped.forks.add(r.nameWithOwner);
+          else if (r.stargazerCount > maxStars) skipped.hubs.add(r.nameWithOwner);
+          else return true;
+          return false;
+        });
+        kept.sort((a, b) => a.stargazerCount - b.stargazerCount);
+        return [login, kept.slice(0, maxRepos).map((r) => r.nameWithOwner)];
+      }));
+
+      let stop = null;
+      const todo = [...new Set([...reposOf.values()].flat())].filter((r) => !contributorsOf.has(r));
+      await runPool(todo, concurrency, async (repo) => {
+        const r = await fetch(`/api/contributors/${repo}`, NO_LIST);
+        if (r.stop) {
+          stop = r.stop;
+          return false;
+        }
+        contributorsOf.set(repo, readList(repo, r.res));
+        return true;
+      });
+
+      const neighbours = new Map();
+      let units = 0;
+      for (const login of batch) {
+        const repos = reposOf.get(login);
+        units += repos.length;
+        const best = new Map(); // neighbour -> entry, keeping the repo where both did the most
+        for (const repo of repos) {
+          const list = contributorsOf.get(repo);
+          const me = list?.get(login.toLowerCase());
+          if (!me || me.contributions < minCommits) continue;
+          for (const c of list.values()) {
+            if (c === me || c.contributions < minCommits) continue;
+            let e = best.get(c.login);
+            if (!e) {
+              e = { login: c.login, avatar_url: c.avatar_url, html_url: c.html_url, weight: 0, commits: 0, via: null };
+              best.set(c.login, e);
+            }
+            e.weight += 1;
+            e.commits += c.contributions;
+            if (!e.via || Math.min(me.contributions, c.contributions) > Math.min(e.via.aCommits, e.via.bCommits)) {
+              e.via = { repo, aCommits: me.contributions, bCommits: c.contributions };
+            }
+          }
+        }
+        neighbours.set(login, [...best.values()]);
+      }
+      return { neighbours, units, stop };
+    },
+  };
+}
+
+// Why a collaboration search can come back empty, in terms of its settings.
+// Never claims that no connection exists.
+export function collabHint({ maxContributors, minCommits, maxDegrees }) {
+  return `Collaboration links skip repositories with more than ${maxContributors} contributors and anyone with fewer than `
+    + `${minCommits} ${minCommits === 1 ? 'commit' : 'commits'} in a repository, the search stops at ${maxDegrees} `
+    + `${maxDegrees === 1 ? 'step' : 'steps'}, and the GitHub rate limit can cut it short. A connection may still exist `
+    + 'outside those limits: try a higher contributor limit, fewer minimum commits or more degrees.';
 }
 
 // Number of shortest paths from the side's root to `login`, by summing over
@@ -149,7 +292,9 @@ const END_REASONS = {
 // timeline), passing each one to `onEvent` as it happens. The events only
 // report; they never change which chain is found.
 export async function findConnection(source, target, opts) {
-  const { onEvent = () => {}, mode = 'either', maxDegrees = 6 } = opts;
+  const { onEvent = () => {}, mode = 'either', link = 'follows' } = opts;
+  // Each collaboration degree costs far more requests, so it stops sooner by default.
+  const maxDegrees = opts.maxDegrees ?? (link === 'collab' ? 4 : 6);
   const startedAt = Date.now();
   const timeline = [];
   const emit = (type, data) => {
@@ -158,10 +303,10 @@ export async function findConnection(source, target, opts) {
     onEvent(event);
   };
 
-  emit('start', { source, target, mode, maxDegrees });
+  emit('start', { source, target, mode, maxDegrees, ...(link === 'collab' ? { link } : {}) });
   let result;
   try {
-    result = await search(source, target, opts, emit);
+    result = await search(source, target, { ...opts, maxDegrees }, emit);
   } catch (err) {
     const stopped = err?.code === 'aborted' || err?.name === 'AbortError';
     emit('end', { found: false, reason: stopped ? 'stopped' : 'error', detail: err?.code ?? 'error', stats: null });
@@ -193,17 +338,33 @@ async function search(source, target, opts, emit) {
     // used so far (and never more than maxRequests in total).
     altRoutes = true,
     extraBudget = 0.25,
+    // 'follows' links people by a follow; 'collab' by a repo both committed to.
+    link = 'follows',
+    minCommits = 2,
+    maxContributors = 50,
+    maxRepos = 30,
+    maxStars = 5000,
     signal,
     onProgress = () => {},
   } = opts;
 
+  const collab = link === 'collab';
+  const expander = collab
+    ? createCollabExpander({ minCommits, maxContributors, maxRepos, maxStars })
+    : createFollowsExpander({ maxPages, mode, concurrency });
   const startedAt = Date.now();
   let requests = 0; // real GitHub requests
   let cacheHits = 0; // answered from the server's cache, costing no quota
   let checked = 0;
   const edges = new Set(); // "a>b" means a follows b
+  const vias = new Map(); // "a|b" (sorted) -> { repo, a, aCommits, bCommits }, in collaboration mode
+  const pairKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 
-  const stats = () => ({ explored: 0, requests, cacheHits, ms: Date.now() - startedAt });
+  const skippedCounts = () => {
+    const s = expander.skipped;
+    return s ? { skipped: { hubs: s.hubs.size, forks: s.forks.size, bots: s.bots.size } } : {};
+  };
+  const stats = (explored = 0) => ({ explored, requests, cacheHits, ms: Date.now() - startedAt, ...skippedCounts() });
 
   if (source.trim().toLowerCase() === target.trim().toLowerCase()) {
     return { status: 'same', source, target, path: [source], hops: [], stats: stats() };
@@ -247,10 +408,10 @@ async function search(source, target, opts, emit) {
   const impossible = (reason, login) => ({
     status: 'not_found', reason, login, source: srcUser.login, target: tgtUser.login, stats: stats(),
   });
-  for (const u of [srcUser, tgtUser]) {
+  for (const u of collab ? [] : [srcUser, tgtUser]) {
     if (u.followers === 0 && u.following === 0) return impossible('isolated', u.login);
   }
-  if (mode === 'chain') {
+  if (mode === 'chain' && !collab) {
     if (srcUser.following === 0) return impossible('source_follows_nobody', srcUser.login);
     if (tgtUser.followers === 0) return impossible('target_has_no_followers', tgtUser.login);
   }
@@ -261,106 +422,112 @@ async function search(source, target, opts, emit) {
     emit('discover', { side, login: u.login, parent: null, depth: 0, avatarUrl: u.avatar_url, edge: null });
   }
 
-  function kindsFor(isSourceSide) {
-    if (mode === 'chain') return isSourceSide ? ['following'] : ['followers'];
-    return ['following', 'followers'];
-  }
-
   let reason = null;
   let stopInfo = {};
   let round = 0;
+
+  // One GitHub call for an expander, with the checks every call needs.
+  // Returns { res }, or { stop } when the round has to end.
+  async function call(path, ceiling, allow = []) {
+    if (signal?.aborted) return { stop: { reason: 'aborted' } };
+    if (requests >= ceiling) return { stop: { reason: 'budget' } };
+    let res;
+    try {
+      res = await get(path);
+    } catch (err) {
+      if (err?.name === 'AbortError') return { stop: { reason: 'aborted' } };
+      throw err;
+    }
+    onProgress({
+      degree: sideS.depth + sideT.depth, checked, requests, cacheHits, remaining: res.remaining, maxRequests, ...skippedCounts(),
+    });
+
+    if (res.status === 401) throw new SearchError('bad_token', 'GitHub token is invalid');
+    if (res.status === 429 && res.data?.limit === 'per_ip') return { stop: { reason: 'ip_limit', retryAfter: res.data.retryAfter } };
+    if (res.status === 403 || res.status === 429) return { stop: { reason: 'rate_limit', reset: res.reset } };
+    // A failed request is not the frontier running dry; keep the two
+    // apart so a real error never shows up as "no link found".
+    if (res.status !== 200 && !allow.includes(res.status)) return { stop: { reason: 'error', message: res.data?.message } };
+    return { res };
+  }
+
+  // What expanding a side would take: people waiting times the average work
+  // per person seen so far (follower lists in follows mode, repos in collaboration).
+  const cost = (side) => side.frontier.length * (side.expanded ? side.units / side.expanded : expander.defaultCost);
 
   // Expands one side by a degree. Returns why it stopped early, or null.
   async function expandRound(expandSource, ceiling, extra = false) {
     const side = expandSource ? sideS : sideT;
     const other = expandSource ? sideT : sideS;
     const sideName = expandSource ? 'source' : 'target';
-    // The cost is the number of people this side still has to check, the
-    // same number the choice of side compares.
+    // The same costs the choice of side compares.
     emit('round', {
       round: ++round,
       side: sideName,
       depth: side.depth + 1,
       frontierSize: side.frontier.length,
-      estimatedCost: side.frontier.length,
-      otherSideCost: other.frontier.length,
+      estimatedCost: Math.round(cost(side)),
+      otherSideCost: Math.round(cost(other)),
       ...(extra ? { extra: true } : {}),
     });
     side.depth += 1;
 
+    // Hubs first: people reached through more links (or more commits).
     const ordered = [...side.frontier].sort(
-      (a, b) => (side.discoveredBy.get(b) || 0) - (side.discoveredBy.get(a) || 0),
+      (a, b) => (side.discoveredBy.get(b) || 0) - (side.discoveredBy.get(a) || 0)
+        || (side.commitsBy.get(b) || 0) - (side.commitsBy.get(a) || 0),
     );
     const nextDiscovered = new Map();
+    const nextCommits = new Map();
     let roundStop = null;
 
-    await runPool(ordered, concurrency, async (login) => {
-      emit('expand', { side: sideName, login, depth: side.depth - 1 });
-      for (const kind of kindsFor(expandSource)) {
-        let page = 1;
-        while (page <= maxPages) {
-          if (signal?.aborted) { roundStop = { reason: 'aborted' }; return false; }
-          if (requests >= ceiling) { roundStop = { reason: 'budget' }; return false; }
-          let res;
-          try {
-            res = await get(`/api/${kind}/${login}?page=${page}`);
-          } catch (err) {
-            if (err?.name === 'AbortError') { roundStop = { reason: 'aborted' }; return false; }
-            throw err;
-          }
-          onProgress({ degree: sideS.depth + sideT.depth, checked, requests, cacheHits, remaining: res.remaining });
+    function addNeighbour(login, n) {
+      const neighbor = n.login;
+      if (neighbor === login) return;
+      if (n.edge) edges.add(`${n.edge.from}>${n.edge.to}`);
+      if (n.via && !vias.has(pairKey(login, neighbor))) vias.set(pairKey(login, neighbor), { a: login, ...n.via });
 
-          if (res.status === 401) throw new SearchError('bad_token', 'GitHub token is invalid');
-          if (res.status === 429 && res.data?.limit === 'per_ip') {
-            roundStop = { reason: 'ip_limit', retryAfter: res.data.retryAfter };
-            return false;
-          }
-          if (res.status === 403 || res.status === 429) {
-            roundStop = { reason: 'rate_limit', reset: res.reset };
-            return false;
-          }
-          // A failed request is not the frontier running dry; keep the two
-          // apart so a real error never shows up as "no link found".
-          if (res.status !== 200) {
-            roundStop = { reason: 'error', message: res.data?.message };
-            return false;
-          }
-
-          const items = res.data.items ?? [];
-          for (const u of items) {
-            const neighbor = u.login;
-            if (neighbor === login) continue;
-            if (kind === 'following') edges.add(`${login}>${neighbor}`);
-            else edges.add(`${neighbor}>${login}`);
-
-            nextDiscovered.set(neighbor, (nextDiscovered.get(neighbor) || 0) + 1);
-            if (!side.nodes.has(neighbor)) {
-              side.nodes.set(neighbor, { avatar_url: u.avatar_url, html_url: u.html_url, depth: side.depth });
-              side.parent.set(neighbor, login);
-              side.parents.set(neighbor, [login]);
-              emit('discover', {
-                side: sideName,
-                login: neighbor,
-                parent: login,
-                depth: side.depth,
-                avatarUrl: u.avatar_url,
-                edge: kind === 'following' ? { from: login, to: neighbor } : { from: neighbor, to: login },
-              });
-            } else if (side.nodes.get(neighbor).depth === side.depth) {
-              const ps = side.parents.get(neighbor);
-              if (!ps.includes(login)) ps.push(login);
-            }
-          }
-          if (items.length < 100) break;
-          page += 1;
-        }
+      nextDiscovered.set(neighbor, (nextDiscovered.get(neighbor) || 0) + (n.weight ?? 1));
+      if (n.commits) nextCommits.set(neighbor, (nextCommits.get(neighbor) || 0) + n.commits);
+      if (!side.nodes.has(neighbor)) {
+        side.nodes.set(neighbor, { avatar_url: n.avatar_url, html_url: n.html_url, depth: side.depth });
+        side.parent.set(neighbor, login);
+        side.parents.set(neighbor, [login]);
+        emit('discover', {
+          side: sideName,
+          login: neighbor,
+          parent: login,
+          depth: side.depth,
+          avatarUrl: n.avatar_url,
+          edge: n.edge ?? { from: login, to: neighbor, repo: n.via.repo },
+        });
+      } else if (side.nodes.get(neighbor).depth === side.depth) {
+        const ps = side.parents.get(neighbor);
+        if (!ps.includes(login)) ps.push(login);
       }
-      checked += 1;
+    }
+
+    const batches = [];
+    for (let i = 0; i < ordered.length; i += expander.batchSize) batches.push(ordered.slice(i, i + expander.batchSize));
+    const fetchFor = (path, allow) => call(path, ceiling, allow);
+
+    await runPool(batches, expander.concurrency, async (batch) => {
+      for (const login of batch) emit('expand', { side: sideName, login, depth: side.depth - 1 });
+      const { neighbours, units, stop } = await expander.expand(batch, fetchFor, expandSource);
+      for (const [login, list] of neighbours) for (const n of list) addNeighbour(login, n);
+      if (stop) {
+        roundStop = stop;
+        return false;
+      }
+      side.expanded += batch.length;
+      side.units += units;
+      checked += batch.length;
       return true;
     });
 
     side.frontier = [...nextDiscovered.keys()].filter((login) => side.nodes.get(login).depth === side.depth);
     side.discoveredBy = nextDiscovered;
+    side.commitsBy = nextCommits;
     return roundStop;
   }
 
@@ -385,7 +552,7 @@ async function search(source, target, opts, emit) {
     if (!sideS.frontier.length || !sideT.frontier.length) { reason = 'dead_end'; break; }
     if (signal?.aborted) { reason = 'aborted'; break; }
 
-    const expandSource = sideS.frontier.length <= sideT.frontier.length;
+    const expandSource = cost(sideS) <= cost(sideT);
     const roundStop = await expandRound(expandSource, maxRequests);
     if (roundStop) { ({ reason, ...stopInfo } = roundStop); break; }
 
@@ -398,23 +565,25 @@ async function search(source, target, opts, emit) {
   }
 
   if (!meetLogins) {
+    const limits = collab ? { maxDegrees, minCommits, maxContributors, maxRepos } : { maxDegrees, maxPages };
     return {
       status: 'not_found',
       reason,
       resetAt: stopInfo.reset ?? null,
       message: stopInfo.message ?? null,
       retryAfter: stopInfo.retryAfter ?? null,
-      limits: { maxDegrees, maxPages },
+      limits,
+      ...(collab ? { link, hint: collabHint(limits) } : {}),
       source: srcUser.login,
       target: tgtUser.login,
       explored: { source: sideSnapshot(sideS), target: sideSnapshot(sideT) },
-      stats: { explored: sideS.nodes.size + sideT.nodes.size, requests, cacheHits, ms: Date.now() - startedAt },
+      stats: stats(sideS.nodes.size + sideT.nodes.size),
     };
   }
 
   const s = srcUser.login;
   const t = tgtUser.login;
-  const directed = mode === 'chain';
+  const directed = mode === 'chain' && !collab;
   const firstMeet = meetLogins[0];
   emit('meet', { login: firstMeet, sourceDepth: sideS.nodes.get(firstMeet).depth, targetDepth: sideT.nodes.get(firstMeet).depth });
 
@@ -435,7 +604,7 @@ async function search(source, target, opts, emit) {
     altRoutes && shortest + 1 <= maxDegrees && !signal?.aborted && (frontiers[0] || frontiers[1])
     && maxDisjointRoutes(toGraph(routeLinks, directed), s, t).count < SHOWN_CHAINS
   ) {
-    const expandSource = frontiers[1] === 0 || (frontiers[0] > 0 && frontiers[0] <= frontiers[1]);
+    const expandSource = frontiers[1] === 0 || (frontiers[0] > 0 && cost(sideS) <= cost(sideT));
     const ceiling = Math.min(maxRequests, requests + Math.ceil(requests * extraBudget));
     try {
       await expandRound(expandSource, ceiling, true);
@@ -448,7 +617,17 @@ async function search(source, target, opts, emit) {
     candidates = [...candidates, ...sampleChains(sideS, sideT, alt, CHAIN_SAMPLE)];
   }
 
-  const hopsOf = (logins) => logins.slice(0, -1).map((from, i) => ({ from, to: logins[i + 1], direction: relation(from, logins[i + 1], edges) }));
+  // A collaboration hop carries the shared repo and both commit counts, from `from`'s side.
+  const viaOf = (from, to) => {
+    const v = vias.get(pairKey(from, to));
+    return v.a === from
+      ? { repo: v.repo, aCommits: v.aCommits, bCommits: v.bCommits }
+      : { repo: v.repo, aCommits: v.bCommits, bCommits: v.aCommits };
+  };
+  const hopsOf = (logins) => logins.slice(0, -1).map((from, i) => {
+    const to = logins[i + 1];
+    return collab ? { from, to, direction: 'collab', via: viaOf(from, to) } : { from, to, direction: relation(from, to, edges) };
+  });
   const asCandidate = (logins) => ({ logins, mutualHops: hopsOf(logins).filter((h) => h.direction === 'mutual').length });
 
   // Routes and gatekeepers are counted over the chains found, so the summary
@@ -505,6 +684,7 @@ async function search(source, target, opts, emit) {
     gatekeepers,
     nodesInfo,
     explored,
-    stats: { explored: sideS.nodes.size + sideT.nodes.size, requests, cacheHits, ms: Date.now() - startedAt },
+    ...(collab ? { link } : {}),
+    stats: stats(sideS.nodes.size + sideT.nodes.size),
   };
 }

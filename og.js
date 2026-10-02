@@ -14,6 +14,7 @@ const MUTED = '#9aa3b2';
 const ACCENT = '#5b8cff'; // the app's dark-theme accent
 const PAD = 60;
 const ARROW_W = 56;
+const REPO_GAP_W = 120; // room for a repo name between two people
 
 // satori can't read WOFF2, so load the WOFF files once at startup.
 const require = createRequire(import.meta.url);
@@ -37,6 +38,12 @@ const arrowSvg = (kind, size = 40, color = ACCENT) => {
   if (kind !== 'forward') body += head(6, 1);
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 40 40">${body}</svg>`;
   return img(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`, size, size);
+};
+
+// A plain link with no direction, for two people who share a repo.
+const lineSvg = (width, color = ACCENT) => {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="40" viewBox="0 0 ${width} 40"><path d="M6 20 H${width - 6}" stroke="${color}" stroke-width="4" stroke-linecap="round"/></svg>`;
+  return img(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`, width, 40);
 };
 
 const host = (publicUrl) => new URL(publicUrl).host;
@@ -68,9 +75,9 @@ function avatar(login, src, size) {
   }, login[0].toUpperCase());
 }
 
-function person(login, src, size, colW, labelSize) {
+function person(login, src, size, colW, labelSize, gapW = ARROW_W) {
   // The label may spill into the arrow gaps on either side, so long names survive 8-person rows.
-  const labelW = colW + ARROW_W - 8;
+  const labelW = colW + gapW - 8;
   return h('div', { display: 'flex', flexDirection: 'column', alignItems: 'center', width: colW }, [
     avatar(login, src, size),
     h('div', { display: 'flex', justifyContent: 'center', width: labelW, marginTop: 14 },
@@ -106,9 +113,11 @@ const fontSizeFor = (text) => (text.length > 34 ? 40 : text.length > 24 ? 52 : 6
 
 function chainCard(verified, avatars, publicUrl, gatekeeper) {
   const { users, edges } = verified;
+  const collab = edges.some((e) => e.repo);
+  const gapW = collab ? REPO_GAP_W : ARROW_W;
   const n = users.length;
   const degrees = n - 1;
-  const colW = Math.floor((W - 2 * PAD - (n - 1) * ARROW_W) / n);
+  const colW = Math.floor((W - 2 * PAD - (n - 1) * gapW) / n);
   const size = Math.min(128, colW);
   const labelSize = n > 6 ? 18 : n > 4 ? 22 : 26;
   const first = users[0].login;
@@ -116,17 +125,32 @@ function chainCard(verified, avatars, publicUrl, gatekeeper) {
 
   const row = [];
   users.forEach((u, i) => {
-    row.push(person(u.login, avatars[i], size, colW, labelSize));
+    row.push(person(u.login, avatars[i], size, colW, labelSize, gapW));
     if (i < n - 1) {
       const e = edges[i];
-      const kind = e.aFollowsB && e.bFollowsA ? 'both' : e.aFollowsB ? 'forward' : 'back';
-      row.push(h('div', { display: 'flex', justifyContent: 'center', width: ARROW_W, marginTop: -(size / 2) - 14 }, arrowSvg(kind)));
+      if (collab) {
+        // The shared repo sits on the link between the two people.
+        row.push(h('div', {
+          display: 'flex', flexDirection: 'column', alignItems: 'center', width: gapW, marginTop: -(size / 2) - 14 - 48,
+        }, [
+          h('div', {
+            display: 'block', maxWidth: gapW - 4, fontSize: 20, color: ACCENT,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }, e.repo.split('/')[1]),
+          lineSvg(gapW - 8),
+        ]));
+      } else {
+        const kind = e.aFollowsB && e.bFollowsA ? 'both' : e.aFollowsB ? 'forward' : 'back';
+        row.push(h('div', { display: 'flex', justifyContent: 'center', width: ARROW_W, marginTop: -(size / 2) - 14 }, arrowSvg(kind)));
+      }
     }
   });
 
   return frame([
     headline([`@${first}`, arrowSvg('forward', 52), `@${last}`], fontSizeFor(`@${first}@${last}`)),
-    h('div', { display: 'flex', marginTop: 14, fontSize: 34, color: MUTED }, `${degrees} ${degrees === 1 ? 'degree' : 'degrees'} apart on GitHub`),
+    h('div', { display: 'flex', marginTop: 14, fontSize: 34, color: MUTED }, collab
+      ? `${degrees} collaboration ${degrees === 1 ? 'step' : 'steps'} apart on GitHub`
+      : `${degrees} ${degrees === 1 ? 'degree' : 'degrees'} apart on GitHub`),
     h('div', { display: 'flex', alignItems: 'center', marginTop: gatekeeper ? 40 : 56 }, row),
     ...(gatekeeper
       ? [h('div', { display: 'flex', marginTop: 36, fontSize: 30, color: ACCENT }, `Every route goes through @${gatekeeper}`)]
@@ -138,7 +162,7 @@ function questionCard(q, avatars, publicUrl) {
   const size = 150;
   return frame([
     headline([`@${q.from}`, arrowSvg('forward', 52), '?', arrowSvg('forward', 52), `@${q.to}`], fontSizeFor(`@${q.from}?@${q.to}`) * 0.8),
-    h('div', { display: 'flex', marginTop: 14, fontSize: 34, color: MUTED }, 'How many follows apart are they?'),
+    h('div', { display: 'flex', marginTop: 14, fontSize: 34, color: MUTED }, q.link === 'collab' ? 'How many shared repositories apart are they?' : 'How many follows apart are they?'),
     h('div', { display: 'flex', alignItems: 'center', gap: 40, marginTop: 50 }, [
       person(q.from, avatars[0], size, 260, 26),
       h('div', { display: 'flex', fontSize: 72, fontWeight: 700, color: ACCENT }, '?'),

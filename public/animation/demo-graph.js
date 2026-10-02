@@ -95,7 +95,104 @@ export function buildDemoGraph(seed = DEMO_SEED) {
 
   const graph = { logins, following, followers, hubs: hubs.map((h) => logins[h]) };
   addIsland(graph);
+  addCollabData(graph, mulberry32(seed ^ 0x5eed)); // its own stream, so the follow network stays as it was
   return graph;
+}
+
+// ---- Collaboration data: who committed to which repo ----
+// About 400 small repos of 3-30 people who sit near each other on the ring
+// (with the odd outsider), so collaboration is a small world too. On top: hub
+// repos everyone contributes to, forks that copy their upstream's contributors,
+// two bots, and a couple of empty repos, so the demo shows each being skipped.
+
+const REPO_WORDS = [
+  'parser', 'cli', 'dotfiles', 'api', 'docs', 'engine', 'sdk', 'ui-kit', 'router', 'auth',
+  'charts', 'notes', 'scripts', 'server', 'cache', 'sync', 'lint', 'bench', 'tools', 'web',
+];
+export const DEMO_BOTS = ['dependabot[bot]', 'renovate[bot]'];
+export const DEMO_HUBS = [
+  { name: 'nebula-labs/framework', contributors: 360, stars: 48000 }, // skipped for its stars
+  { name: 'nebula-labs/awesome-list', contributors: 320, stars: 3100 }, // skipped for its contributor count
+  { name: 'open-source-guild/website', contributors: 300, stars: 900 },
+];
+const REPOS = 400;
+const WINDOW = 25; // contributors come from within 25 places on the ring
+
+function addCollabData(graph, rand) {
+  const { logins } = graph;
+  const people = logins.length;
+  const pick = (n) => Math.floor(rand() * n);
+  const repos = new Map(); // name -> { stars, isFork, contributors: [{ login, commits, bot }] }
+  const reposOf = new Map(logins.map((l) => [l, []]));
+  const add = (name, stars, isFork, members) => {
+    repos.set(name, { stars, isFork, contributors: members });
+    for (const m of members) if (!m.bot) reposOf.get(m.login).push(name);
+  };
+  // A quarter of contributors made a single commit, below the default minimum.
+  const commits = () => (rand() < 0.25 ? 1 : 2 + pick(60));
+
+  for (let k = 0; k < REPOS; k++) {
+    const center = pick(people);
+    const size = 3 + pick(28);
+    const members = new Map();
+    while (members.size < size) {
+      const i = rand() < 0.12 ? pick(people) : (center + pick(2 * WINDOW + 1) - WINDOW + people) % people;
+      members.set(logins[i], { login: logins[i], commits: members.size ? commits() : 20 + pick(200), bot: false });
+    }
+    if (rand() < 0.25) members.set(DEMO_BOTS[k % 2], { login: DEMO_BOTS[k % 2], commits: 5 + pick(40), bot: true });
+    const owner = [...members.keys()][0];
+    let name = `${owner}/${REPO_WORDS[pick(REPO_WORDS.length)]}`;
+    if (repos.has(name)) name += `-${k}`;
+    add(name, rand() < 0.1 ? 1000 + pick(4000) : pick(400), false, [...members.values()]);
+  }
+  for (const hub of DEMO_HUBS) {
+    const members = new Map();
+    while (members.size < hub.contributors) {
+      const login = logins[pick(people)];
+      members.set(login, { login, commits: 2 + pick(300), bot: false });
+    }
+    add(hub.name, hub.stars, false, [...members.values()].sort((a, b) => b.commits - a.commits));
+  }
+  // Forks: someone's copy of a repo, listing the upstream's contributors as its own.
+  const upstreams = [...repos.keys()].filter((n) => !DEMO_HUBS.some((h) => h.name === n));
+  for (let k = 0; k < 30; k++) {
+    const up = repos.get(upstreams[pick(upstreams.length)]);
+    const forker = logins[pick(people)];
+    const name = `${forker}/fork-${k}`;
+    add(name, pick(5), true, [...up.contributors.filter((c) => c.login !== forker), { login: forker, commits: 2 + pick(5), bot: false }]);
+  }
+  // Empty repos: GitHub answers 204 for their contributors.
+  for (let k = 0; k < 2; k++) {
+    const owner = logins[pick(people)];
+    const name = `${owner}/empty-${k}`;
+    repos.set(name, { stars: 0, isFork: false, contributors: [] });
+    reposOf.get(owner).push(name);
+  }
+  graph.repos = repos;
+  graph.reposOf = reposOf;
+}
+
+// Collaboration steps from `from` with the search's default filters
+// (2 commits each, at most 50 contributors and 5,000 stars, no forks or bots).
+export function collabDistances(graph, from, { minCommits = 2, maxContributors = 50, maxStars = 5000 } = {}) {
+  const usable = (r) => !r.isFork && r.stars <= maxStars && r.contributors.length <= Math.min(100, maxContributors);
+  const dist = new Map([[from, 0]]);
+  const queue = [from];
+  for (let i = 0; i < queue.length; i++) {
+    const cur = queue[i];
+    for (const name of graph.reposOf.get(cur) ?? []) {
+      const r = graph.repos.get(name);
+      if (!usable(r)) continue;
+      const members = r.contributors.filter((c) => !c.bot && c.commits >= minCommits);
+      if (!members.some((c) => c.login === cur)) continue;
+      for (const c of members) {
+        if (dist.has(c.login)) continue;
+        dist.set(c.login, dist.get(cur) + 1);
+        queue.push(c.login);
+      }
+    }
+  }
+  return dist;
 }
 
 // A small island whose only way out is one person, @nora-quill, for the
@@ -191,10 +288,20 @@ function routesPair(graph) {
   return DEMO_PAIR;
 }
 
+// The Collaboration demo: from the demo source (or the first person with
+// repos), someone 4 collaboration steps away, or as far as the default 4 allow.
+function collabPair(graph) {
+  const source = [DEMO_PAIR.source, ...graph.logins].find((l) => graph.reposOf.get(l).length >= 2);
+  const dist = collabDistances(graph, source);
+  const far = Math.min(4, Math.max(...dist.values()));
+  return { source, target: graph.logins.find((l) => dist.get(l) === far), degrees: far, link: 'collab' };
+}
+
 export const DEMO_PAIRS = {
   long: DEMO_PAIR,
   gatekeeper: { source: ISLAND.source, target: ISLAND.target, degrees: distances(demoGraph, ISLAND.source).get(ISLAND.target) },
   routes: routesPair(demoGraph),
+  collab: collabPair(demoGraph),
 };
 
 const avatars = new Map();
@@ -243,6 +350,34 @@ export function createDemoFetch({ graph = demoGraph, delayMs = 220 } = {}) {
       const all = graph[kind].get(login) ?? [];
       const slice = all.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
       return ok({ items: slice.map((l) => ({ login: l, avatar_url: demoAvatar(l), html_url: null })) });
+    }
+    // The batched GraphQL answer: each person's repos, newest first on GitHub (any order here).
+    const repoQuery = path.match(/^\/api\/repos\?users=([^&]+)$/);
+    if (repoQuery) {
+      const users = {};
+      for (const login of repoQuery[1].split(',')) {
+        users[login] = graph.reposOf.has(login)
+          ? graph.reposOf.get(login).slice(0, 50).map((name) => {
+            const r = graph.repos.get(name);
+            return { nameWithOwner: name, stargazerCount: r.stars, isFork: r.isFork, isArchived: false };
+          })
+          : null;
+      }
+      return ok({ users });
+    }
+    // One page of contributors, most commits first, like GitHub's list.
+    const contrib = path.match(/^\/api\/contributors\/([^/?]+\/[^/?]+)$/);
+    if (contrib) {
+      const repo = graph.repos.get(contrib[1]);
+      if (!repo) return { status: 404, data: { message: 'Not Found' }, remaining: null, reset: null, cached: false };
+      if (!repo.contributors.length) return { status: 204, data: null, remaining: null, reset: null, cached: false };
+      const sorted = [...repo.contributors].sort((a, b) => b.commits - a.commits);
+      return ok({
+        items: sorted.slice(0, PAGE_SIZE).map((c) => ({
+          login: c.login, avatar_url: demoAvatar(c.login), html_url: null, type: c.bot ? 'Bot' : 'User', contributions: c.commits,
+        })),
+        more: sorted.length > PAGE_SIZE,
+      });
     }
     return { status: 404, data: { message: 'Not Found' }, remaining: null, reset: null, cached: false };
   };

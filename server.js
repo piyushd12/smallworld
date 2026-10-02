@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { rateLimit } from 'express-rate-limit';
-import { isValidLogin, parseShareQuery, buildShareQuery } from './public/share.js';
+import { isValidLogin, isValidRepo, parseShareQuery, buildShareQuery } from './public/share.js';
 import { renderOg, renderDefault } from './og.js';
 
 export { isValidLogin };
@@ -141,7 +141,7 @@ if (usingRedis) {
 
 // Returns { status, body, remaining, reset, cacheStatus } where cacheStatus is
 // hit | revalidated | stale | miss, or { networkError } / { limited, retryAfter }.
-// `compact` shrinks a 200 body before it's cached.
+// `compact(body, headers)` shrinks a 200 body before it's cached.
 async function ghGet(apiPath, { ip, compact = (b) => b, cacheable = true } = {}) {
   // If the store is down, carry on uncached (and unmetered) rather than fail every request.
   const cached = cacheable ? await store.get(apiPath).catch(() => null) : null;
@@ -190,7 +190,7 @@ async function ghGet(apiPath, { ip, compact = (b) => b, cacheable = true } = {})
 
   const entry = {
     status: response.status,
-    body: response.status === 200 ? compact(body) : { message: body?.message },
+    body: response.status === 200 ? compact(body, response.headers) : { message: body?.message },
     etag: response.headers.get('etag'),
     fetchedAt: Date.now(),
   };
@@ -271,6 +271,107 @@ app.get('/api/rate_limit', async (req, res) => {
   reply(res, r, (body) => body);
 });
 
+// ---- Collaboration: who committed where ----
+
+// One page of a repo's contributors, stored as [login, id, isBot, commits].
+// `more` marks a full page with a next link: over 100 contributors, a hub.
+const compactContributors = (list, headers) => ({
+  items: (Array.isArray(list) ? list : []).map((c) => [c.login, c.id, c.type === 'Bot' ? 1 : 0, c.contributions]),
+  more: /rel="next"/.test(headers?.get('link') ?? ''),
+});
+const expandContributor = ([login, id, bot, contributions]) => ({
+  ...expandListUser([login, id]),
+  type: bot ? 'Bot' : 'User',
+  contributions,
+});
+
+// GitHub refuses to list contributors of its very largest repos; those are hubs anyway.
+async function contributors(repo, ip) {
+  const r = await ghGet(`/repos/${repo.toLowerCase()}/contributors?per_page=100&anon=0`, { ip, compact: compactContributors });
+  if (r.status === 403 && /too large/i.test(r.body?.message ?? '')) return { ...r, status: 200, body: { items: [], more: true } };
+  return r;
+}
+
+app.get('/api/contributors/:owner/:repo', async (req, res) => {
+  const repo = `${req.params.owner}/${req.params.repo}`;
+  if (!isValidRepo(repo)) return res.status(400).json({ message: 'Invalid repository' });
+  const r = await contributors(repo, req.ip);
+  reply(res, r, (body) => ({ items: body.items.map(expandContributor), more: body.more }));
+});
+
+// GraphQL has no contributor lists, but it is the only way to ask which repos
+// a person committed to, and one aliased query answers up to 15 people.
+const MAX_REPO_USERS = 15;
+const REPOS_FRESH_MS = 24 * HOUR_MS; // no ETags in GraphQL, and these lists change slowly
+const REPOS_FIELDS = 'repositoriesContributedTo(first: 50, includeUserRepositories: true, '
+  + 'contributionTypes: [COMMIT, PULL_REQUEST], orderBy: {field: PUSHED_AT, direction: DESC}) '
+  + '{ nodes { nameWithOwner stargazerCount isFork isArchived } }';
+
+// Each person's repos are cached on their own, so only the people missing
+// from the cache go into the query. Returns ghGet's shape, body = { login: repos | null }.
+async function reposOf(logins, ip) {
+  const users = {};
+  const missing = [];
+  for (const login of logins) {
+    const hit = await store.get(`gql:repos:${login.toLowerCase()}`).catch(() => null);
+    if (hit && Date.now() - hit.fetchedAt < REPOS_FRESH_MS) users[login] = hit.repos;
+    else missing.push(login);
+  }
+  if (!missing.length) return { status: 200, body: users, cacheStatus: 'hit' };
+  if (!token) return { status: 400, body: { message: 'Collaboration mode needs a GitHub token on the server (GITHUB_TOKEN)' } };
+
+  const slot = await store.takeSlot(ip).catch(() => ({ ok: true }));
+  if (!slot.ok) return { limited: true, retryAfter: slot.retryAfter };
+
+  const vars = missing.map((_, i) => `$u${i}: String!`).join(', ');
+  const fields = missing.map((_, i) => `u${i}: user(login: $u${i}) { ${REPOS_FIELDS} }`).join(' ');
+  let response;
+  try {
+    response = await fetch('https://api.github.com/graphql', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'smallworld' },
+      body: JSON.stringify({
+        query: `query(${vars}) { rateLimit { remaining resetAt } ${fields} }`,
+        variables: Object.fromEntries(missing.map((login, i) => [`u${i}`, login])),
+      }),
+    });
+  } catch (err) {
+    return { networkError: true, message: err.message };
+  }
+  const body = await response.json().catch(() => null);
+  const errors = body?.errors ?? [];
+  // A spent GraphQL budget comes back as a 200 with a RATE_LIMITED error.
+  const status = errors.some((e) => e.type === 'RATE_LIMITED') ? 403 : response.status;
+  if (status !== 200 || !body?.data) {
+    return { status: status === 200 ? 502 : status, body: { message: errors[0]?.message ?? body?.message } };
+  }
+
+  const fetchedAt = Date.now();
+  for (const [i, login] of missing.entries()) {
+    // A user who doesn't exist comes back as null (with a NOT_FOUND error).
+    const repos = body.data[`u${i}`]?.repositoriesContributedTo.nodes ?? null;
+    users[login] = repos;
+    await store.set(`gql:repos:${login.toLowerCase()}`, { repos, fetchedAt }).catch(() => {});
+  }
+  const rl = body.data.rateLimit;
+  return {
+    status: 200,
+    body: users,
+    remaining: rl?.remaining,
+    reset: rl ? Math.floor(Date.parse(rl.resetAt) / 1000) : null,
+    cacheStatus: 'miss',
+  };
+}
+
+app.get('/api/repos', async (req, res) => {
+  const logins = typeof req.query.users === 'string' ? req.query.users.split(',') : [];
+  if (!logins.length || logins.length > MAX_REPO_USERS || !logins.every(isValidLogin)) {
+    return res.status(400).json({ message: 'Invalid users' });
+  }
+  const r = await reposOf(logins, req.ip);
+  reply(res, r, (users) => ({ users }));
+});
+
 // ---- Sharing: verified chains, link-preview meta tags and preview images ----
 
 const SITE_DESC = 'Find the shortest follow chain between two GitHub users.';
@@ -284,9 +385,30 @@ async function follows(a, b, ip) {
   throw new Error(`GitHub answered ${r.status}`);
 }
 
+// Commits `login` has in a contributors page (compact form), 0 if absent or a bot.
+function commitsIn(items, login) {
+  const c = items.find(([l]) => l.toLowerCase() === login.toLowerCase());
+  return c && !c[2] && !/\[bot\]$/i.test(c[0]) ? c[3] : 0;
+}
+
 // Checks every consecutive pair in both directions. `valid` means each pair is
-// linked by a follow (forward only in follow mode).
-export async function verifyPath(logins, mode, ip) {
+// linked by a follow (forward only in follow mode). With `repos` (collaboration
+// links), each pair must instead both be listed as contributors to their repo,
+// one contributors call per link.
+export async function verifyPath(logins, mode, ip, repos = null) {
+  const users = logins.map((login) => ({ login, avatarUrl: `https://github.com/${login}.png`, url: `https://github.com/${login}` }));
+  if (repos) {
+    const edges = await Promise.all(
+      logins.slice(0, -1).map(async (from, i) => {
+        const r = await contributors(repos[i], ip);
+        if (r.limited || r.networkError) throw new Error('GitHub unavailable');
+        if (![200, 204, 404].includes(r.status)) throw new Error(`GitHub answered ${r.status}`);
+        const items = r.status === 200 ? r.body.items : [];
+        return { from, to: logins[i + 1], repo: repos[i], aCommits: commitsIn(items, from), bCommits: commitsIn(items, logins[i + 1]) };
+      }),
+    );
+    return { valid: edges.every((e) => e.aCommits >= 1 && e.bCommits >= 1), edges, users };
+  }
   const edges = await Promise.all(
     logins.slice(0, -1).map(async (from, i) => {
       const to = logins[i + 1];
@@ -294,17 +416,13 @@ export async function verifyPath(logins, mode, ip) {
       return { from, to, aFollowsB, bFollowsA };
     }),
   );
-  return {
-    valid: edges.every((e) => e.aFollowsB || (mode !== 'follow' && e.bFollowsA)),
-    edges,
-    users: logins.map((login) => ({ login, avatarUrl: `https://github.com/${login}.png`, url: `https://github.com/${login}` })),
-  };
+  return { valid: edges.every((e) => e.aFollowsB || (mode !== 'follow' && e.bFollowsA)), edges, users };
 }
 
 // Crawlers give up after a few seconds, so never let verification outlast that.
 const withTimeout = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(r, ms, null))]);
 const verifyQuietly = (q, ip) =>
-  withTimeout(verifyPath([q.from, ...q.via, q.to], q.mode, ip).catch(() => null), 2500);
+  withTimeout(verifyPath([q.from, ...q.via, q.to], q.mode, ip, q.repos ?? null).catch(() => null), 2500);
 
 const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -316,10 +434,20 @@ export function metaTags(q, verified, publicUrl = PUBLIC_URL) {
   let query = '';
   if (q) {
     query = buildShareQuery(q);
+    const collab = q.link === 'collab';
     if (verified?.valid) {
       const n = verified.users.length - 1;
-      title = `@${q.from} is ${n} ${n === 1 ? 'degree' : 'degrees'} from @${q.to} | smallworld`;
-      desc = `${verified.users.map((u) => u.login).join(' → ')}: the shortest follow chain found on GitHub. Trace your own chain.`;
+      if (collab) {
+        title = `@${q.from} is ${n} collaboration ${n === 1 ? 'step' : 'steps'} from @${q.to} | smallworld`;
+        const chain = verified.edges.map((e) => `@${e.from} and @${e.to} on ${e.repo}`).join(', ');
+        desc = `${chain}: the shortest chain of people who committed to the same repositories. Trace your own chain.`;
+      } else {
+        title = `@${q.from} is ${n} ${n === 1 ? 'degree' : 'degrees'} from @${q.to} | smallworld`;
+        desc = `${verified.users.map((u) => u.login).join(' → ')}: the shortest follow chain found on GitHub. Trace your own chain.`;
+      }
+    } else if (collab) {
+      title = `How many collaboration steps between @${q.from} and @${q.to}? | smallworld`;
+      desc = `Find the shortest chain of shared repositories between @${q.from} and @${q.to} on GitHub.`;
     } else {
       title = `How many follows between @${q.from} and @${q.to}? | smallworld`;
       desc = `Find the shortest chain of follows between @${q.from} and @${q.to} on GitHub.`;
@@ -354,11 +482,14 @@ const shareLimiter = rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: t
 app.get('/api/verify-path', shareLimiter, async (req, res) => {
   const logins = typeof req.query.users === 'string' ? req.query.users.split(',') : [];
   const mode = req.query.mode ?? 'either';
-  if (logins.length < 2 || logins.length > 8 || !logins.every(isValidLogin) || !['either', 'follow'].includes(mode)) {
-    return res.status(400).json({ message: 'Invalid users or mode' });
+  const link = req.query.link ?? 'follows';
+  const repos = link === 'collab' && typeof req.query.repos === 'string' ? req.query.repos.split(',') : null;
+  const reposOk = link === 'follows' || (link === 'collab' && repos?.length === logins.length - 1 && repos.every(isValidRepo));
+  if (logins.length < 2 || logins.length > 8 || !logins.every(isValidLogin) || !['either', 'follow'].includes(mode) || !reposOk) {
+    return res.status(400).json({ message: 'Invalid users, mode or repositories' });
   }
   // On a GitHub failure, say "not valid" and let the page run a normal search.
-  const result = await verifyPath(logins, mode, req.ip).catch(() => ({ valid: false, edges: [], users: [] }));
+  const result = await verifyPath(logins, mode, req.ip, repos).catch(() => ({ valid: false, edges: [], users: [] }));
   res.json(result);
 });
 

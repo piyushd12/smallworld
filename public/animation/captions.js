@@ -22,6 +22,9 @@ export function createCaptions({ caption, names, counters, now = () => performan
     state = {
       names: { source: '', target: '' },
       perDepth: { source: new Map(), target: new Map() },
+      // Collaboration mode: "side:depth" -> Map(repo -> people found through it).
+      reposAt: new Map(),
+      collab: false,
       total: { source: 0, target: 0 },
       depth: { source: 0, target: 0 },
       round: null, // the round being built, summarised when the next one starts
@@ -58,8 +61,17 @@ export function createCaptions({ caption, names, counters, now = () => performan
     state.round = null;
     const n = state.perDepth[r.side].get(r.depth) ?? 0;
     const steps = `${r.depth} step${r.depth === 1 ? '' : 's'}`;
-    say(n ? `Found ${fmt(n)} new ${n === 1 ? 'person' : 'people'} at ${steps} from ${who(r.side)}.`
+    say(n ? `Found ${fmt(n)} new ${n === 1 ? 'person' : 'people'} at ${steps} from ${who(r.side)}${throughRepos(r)}.`
       : `No one new at ${steps} from ${who(r.side)}.`);
+  }
+
+  // " through pallets/flask", or " through pallets/flask and 3 other repos", naming the busiest repo.
+  function throughRepos(r) {
+    const repos = state.reposAt.get(`${r.side}:${r.depth}`);
+    if (!repos?.size) return '';
+    const [top] = [...repos].sort((a, b) => b[1] - a[1])[0];
+    const others = repos.size - 1;
+    return ` through ${top}${others ? ` and ${fmt(others)} other ${others === 1 ? 'repo' : 'repos'}` : ''}`;
   }
 
   function apply(ev) {
@@ -68,6 +80,7 @@ export function createCaptions({ caption, names, counters, now = () => performan
         reset();
         state.names = { source: ev.source, target: ev.target };
         state.maxDegrees = ev.maxDegrees ?? 6;
+        state.collab = ev.link === 'collab';
         say(`Two searches start at once, one from @${ev.source} and one from @${ev.target}. Each round, one of them takes a step outward.`);
         break;
       case 'discover': {
@@ -78,6 +91,12 @@ export function createCaptions({ caption, names, counters, now = () => performan
         } else {
           state.total[side] += 1;
           state.perDepth[side].set(depth, (state.perDepth[side].get(depth) ?? 0) + 1);
+          if (ev.edge?.repo) {
+            const key = `${side}:${depth}`;
+            if (!state.reposAt.has(key)) state.reposAt.set(key, new Map());
+            const repos = state.reposAt.get(key);
+            repos.set(ev.edge.repo, (repos.get(ev.edge.repo) ?? 0) + 1);
+          }
         }
         state.depth[side] = Math.max(state.depth[side], depth);
         updateCounter(side);
@@ -94,14 +113,16 @@ export function createCaptions({ caption, names, counters, now = () => performan
         const theirs = ev.otherSideCost;
         const name = who(ev.side);
         const whose = name.endsWith('s') ? `${name}'` : `${name}'s`;
+        // In collaboration mode the cost is an estimate of repos, not people.
+        const work = (n) => (state.collab ? `about ${fmt(n)} ${n === 1 ? 'repo' : 'repos'}` : people(n));
         say(mine === theirs
-          ? `Round ${ev.round}: expanding ${whose} side. Both sides have ${people(mine)} to check, so the source goes first.`
-          : `Round ${ev.round}: expanding ${whose} side, because it's cheaper (${people(mine)} to check vs ${fmt(theirs)}).`);
+          ? `Round ${ev.round}: expanding ${whose} side. Both sides have ${work(mine)} to check, so the source goes first.`
+          : `Round ${ev.round}: expanding ${whose} side, because it's cheaper (${work(mine)} to check vs ${fmt(theirs)}).`);
         break;
       }
       case 'meet':
         summariseRound();
-        say(`The waves met at @${ev.login}, so the chain is ${ev.sourceDepth + ev.targetDepth} degrees long.`);
+        say(`The waves met at @${ev.login}, so the chain is ${ev.sourceDepth + ev.targetDepth} ${state.collab ? 'collaboration steps' : 'degrees'} long.`);
         break;
       case 'chains':
         summariseRound();
